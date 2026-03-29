@@ -1,6 +1,8 @@
 {
   "name": "belleza-flow-wa-bridge",
   "version": "1.0.0",
+  "description": "WhatsApp QR bridge server for Belleza Flow",
+  "main": "server.js",
   "engines": {
     "node": "20"
   },
@@ -13,27 +15,5 @@
     "express": "^4.18.2",
     "pino": "^8.17.2",
     "qrcode": "^1.5.3"
-  }
-}{
-  "name": "belleza-flow-wa-bridge",
-  "version": "1.0.0",
-  "description": "WhatsApp QR bridge server for Belleza Flow",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "pino": "^8.17.2",
-    "qrcode": "^1.5.3"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
