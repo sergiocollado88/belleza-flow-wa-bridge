@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
 const P = require("pino");
-const { createClient } = require("@supabase/supabase-js");
+const fs = require("fs");
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -15,13 +15,15 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
+const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+if (!BRIDGE_API_KEY) {
+  console.error("BRIDGE_API_KEY env var is required");
+  process.exit(1);
+}
 
-// ─── Session store ─────────────────────────────────────────────────────────
+// ─── In-memory session store ────────────────────────────────────────────────
 const sessions = new Map();
 
 // ─── Auth middleware ────────────────────────────────────────────────────────
@@ -32,19 +34,37 @@ function auth(req, res, next) {
   next();
 }
 
+// ─── Webhook helper ─────────────────────────────────────────────────────────
+async function sendWebhook(type, payload) {
+  if (!WA_WEBHOOK_URL) return;
+  try {
+    const response = await fetch(WA_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": BRIDGE_API_KEY,
+      },
+      body: JSON.stringify({ type, ...payload }),
+    });
+    if (!response.ok) {
+      console.error(`Webhook ${type} failed: ${response.status}`);
+    }
+  } catch (err) {
+    console.error(`Webhook ${type} error:`, err.message);
+  }
+}
+
 // ─── Start / restore a WhatsApp session ────────────────────────────────────
 async function startSession(tenantId) {
   const existing = sessions.get(tenantId);
-  if (existing) {
-    try {
-      const state = existing.ws?.readyState;
-      if (state === 1) return;
-    } catch (_) {}
+  if (existing && (existing.status === "connected" || existing.status === "starting")) {
+    return existing;
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(
-    `./sessions/${tenantId}`
-  );
+  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null };
+  sessions.set(tenantId, sessionData);
+
+  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${tenantId}`);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -55,57 +75,30 @@ async function startSession(tenantId) {
     browser: ["Belleza Flow", "Chrome", "1.0"],
   });
 
-  sessions.set(tenantId, sock);
+  sessionData.sock = sock;
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    const session = sessions.get(tenantId);
     if (qr) {
       const qrImage = await QRCode.toDataURL(qr);
-      await supabase.from("whatsapp_sessions").upsert(
-        {
-          tenant_id: tenantId,
-          status: "qr_pending",
-          qr_code: qrImage,
-          phone_number: null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "tenant_id" }
-      );
+      if (session) { session.status = "qr_pending"; session.qrCode = qrImage; }
+      await sendWebhook("qr_update", { tenant_id: tenantId, status: "qr_pending", qr_code: qrImage });
       console.log(`[${tenantId}] QR updated`);
     }
-
     if (connection === "open") {
       const phone = (sock.user?.id || "").split(":")[0].replace(/\D/g, "");
-      await supabase.from("whatsapp_sessions").upsert(
-        {
-          tenant_id: tenantId,
-          status: "connected",
-          qr_code: null,
-          phone_number: phone,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "tenant_id" }
-      );
+      if (session) { session.status = "connected"; session.qrCode = null; session.phone = phone; }
+      await sendWebhook("connected", { tenant_id: tenantId, status: "connected", phone_number: phone });
       console.log(`[${tenantId}] Connected — phone: ${phone}`);
     }
-
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       sessions.delete(tenantId);
-
-      await supabase.from("whatsapp_sessions").upsert(
-        {
-          tenant_id: tenantId,
-          status: loggedOut ? "disconnected" : "reconnecting",
-          qr_code: null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "tenant_id" }
-      );
-
+      await sendWebhook("disconnected", { tenant_id: tenantId, status: loggedOut ? "disconnected" : "reconnecting", logged_out: loggedOut });
       if (!loggedOut) {
-        console.log(`[${tenantId}] Reconnecting in 5s`);
+        console.log(`[${tenantId}] Reconnecting in 5s…`);
         setTimeout(() => startSession(tenantId), 5000);
       } else {
         console.log(`[${tenantId}] Logged out`);
@@ -120,134 +113,70 @@ async function startSession(tenantId) {
       await handleIncoming(tenantId, msg);
     }
   });
+
+  return sessionData;
 }
 
-// ─── Save incoming WA message to Supabase ─────────────────────────────────
+// ─── Handle incoming WA message ─────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
   const jid = msg.key.remoteJid || "";
   if (jid.endsWith("@g.us")) return;
-
   const phone = jid.replace("@s.whatsapp.net", "").replace(/\D/g, "");
-  const body =
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    "[media]";
+  const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || "[media]";
   const ts = new Date((msg.messageTimestamp || Date.now()) * 1000).toISOString();
-
-  let { data: conv } = await supabase
-    .from("conversations")
-    .select("id, unread_count")
-    .eq("tenant_id", tenantId)
-    .eq("phone", phone)
-    .eq("channel", "whatsapp")
-    .maybeSingle();
-
-  if (!conv) {
-    const { data: newConv } = await supabase
-      .from("conversations")
-      .insert({
-        tenant_id: tenantId,
-        phone,
-        channel: "whatsapp",
-        contact_name: phone,
-        status: "nuevo",
-        unread_count: 1,
-        last_message_at: ts,
-        last_message_preview: body.slice(0, 120),
-      })
-      .select("id, unread_count")
-      .single();
-    conv = newConv;
-  } else {
-    await supabase
-      .from("conversations")
-      .update({
-        unread_count: (conv.unread_count || 0) + 1,
-        last_message_at: ts,
-        last_message_preview: body.slice(0, 120),
-      })
-      .eq("id", conv.id);
-  }
-
-  if (conv?.id) {
-    await supabase.from("messages").insert({
-      conversation_id: conv.id,
-      body,
-      direction: "inbound",
-      channel: "whatsapp",
-      created_at: ts,
-      status: "received",
-      wa_message_id: msg.key.id || null,
-    });
-  }
+  await sendWebhook("incoming_message", { tenant_id: tenantId, phone, body, created_at: ts, wa_message_id: msg.key.id || null, channel: "whatsapp" });
   console.log(`[${tenantId}] Incoming from ${phone}: ${body.slice(0, 40)}`);
 }
 
 // ─── REST endpoints ─────────────────────────────────────────────────────────
-
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/health", (_, res) => res.json({ ok: true, sessions: sessions.size }));
 
 app.post("/session/start", auth, async (req, res) => {
   const { tenant_id } = req.body;
   if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
-  await startSession(tenant_id);
-  res.json({ success: true });
+  const session = await startSession(tenant_id);
+  res.json({ success: true, status: session?.status || "starting", qr_code: session?.qrCode || null, phone: session?.phone || null });
+});
+
+app.get("/session/status/:tenantId", auth, (req, res) => {
+  const session = sessions.get(req.params.tenantId);
+  res.json({ connected: session?.status === "connected", status: session?.status || "disconnected", qr_code: session?.qrCode || null, phone: session?.phone || null });
 });
 
 app.post("/session/disconnect", auth, async (req, res) => {
   const { tenant_id } = req.body;
-  const sock = sessions.get(tenant_id);
-  if (sock) {
-    try { await sock.logout(); } catch (_) {}
-    sessions.delete(tenant_id);
-  }
-  const fs = require("fs");
+  if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
+  const session = sessions.get(tenant_id);
+  if (session?.sock) { try { await session.sock.logout(); } catch (_) {} }
+  sessions.delete(tenant_id);
   const path = `./sessions/${tenant_id}`;
   if (fs.existsSync(path)) fs.rmSync(path, { recursive: true });
-
-  await supabase.from("whatsapp_sessions").upsert(
-    {
-      tenant_id,
-      status: "disconnected",
-      qr_code: null,
-      phone_number: null,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "tenant_id" }
-  );
+  await sendWebhook("disconnected", { tenant_id, status: "disconnected", logged_out: true });
   res.json({ success: true });
 });
 
 app.post("/session/send", auth, async (req, res) => {
   const { tenant_id, phone, message } = req.body;
-  const sock = sessions.get(tenant_id);
-  if (!sock) return res.status(404).json({ error: "Session not found or disconnected" });
-
+  if (!tenant_id || !phone || !message) return res.status(400).json({ error: "tenant_id, phone, message required" });
+  const session = sessions.get(tenant_id);
+  if (!session?.sock || session.status !== "connected") return res.status(404).json({ error: "Session not found or not connected" });
   try {
     const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
+    await session.sock.sendMessage(jid, { text: message });
     res.json({ success: true });
   } catch (err) {
+    console.error(`[${tenant_id}] Send error:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/session/status/:tenantId", auth, async (req, res) => {
-  const sock = sessions.get(req.params.tenantId);
-  res.json({ connected: !!sock });
-});
-
-// ─── On startup: restore sessions ─────────────────────────────────────────
+// ─── On startup: restore sessions from filesystem ─────────────────────────
 async function restoreActiveSessions() {
-  const { data } = await supabase
-    .from("whatsapp_sessions")
-    .select("tenant_id")
-    .in("status", ["connected", "reconnecting"]);
-
-  for (const { tenant_id } of data || []) {
-    console.log(`Restoring session: ${tenant_id}`);
-    await startSession(tenant_id);
+  if (!fs.existsSync("./sessions")) { fs.mkdirSync("./sessions", { recursive: true }); return; }
+  const dirs = fs.readdirSync("./sessions").filter((d) => { try { return fs.statSync(`./sessions/${d}`).isDirectory(); } catch (_) { return false; } });
+  for (const tenantId of dirs) {
+    console.log(`Restoring session: ${tenantId}`);
+    startSession(tenantId).catch((err) => console.error(`Failed to restore ${tenantId}:`, err.message));
   }
 }
 
