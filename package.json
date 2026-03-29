@@ -1,6 +1,22 @@
 {
   "name": "belleza-flow-wa-bridge",
   "version": "1.0.0",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.5",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "pino": "^8.17.2",
+    "qrcode": "^1.5.3"
+  }
+}{
+  "name": "belleza-flow-wa-bridge",
+  "version": "1.0.0",
   "description": "WhatsApp QR bridge server for Belleza Flow",
   "main": "server.js",
   "scripts": {
