@@ -37,6 +37,10 @@ async function getBaileys() {
 // ─── In-memory session store ────────────────────────────────────────────────
 const sessions = new Map();
 
+function normalizePhone(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
 // ─── Auth middleware ────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (req.headers["x-api-key"] !== BRIDGE_API_KEY) {
@@ -89,7 +93,10 @@ async function startSession(tenantId) {
   } = await getBaileys();
 
   const existing = sessions.get(tenantId);
-  if (existing && (existing.status === "connected" || existing.status === "starting")) {
+  if (
+    existing &&
+    ["connected", "starting", "qr_pending", "reconnecting"].includes(existing.status)
+  ) {
     return existing;
   }
 
@@ -130,7 +137,7 @@ async function startSession(tenantId) {
     }
 
     if (connection === "open") {
-      const phone = (sock.user?.id || "").split(":")[0].replace(/\D/g, "");
+      const phone = normalizePhone((sock.user?.id || "").split(":")[0]);
 
       if (session) {
         session.status = "connected";
@@ -150,7 +157,10 @@ async function startSession(tenantId) {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
 
-      sessions.delete(tenantId);
+      if (session) {
+        session.status = loggedOut ? "disconnected" : "reconnecting";
+        session.qrCode = null;
+      }
 
       await sendWebhook("disconnected", {
         tenant_id: tenantId,
@@ -160,11 +170,13 @@ async function startSession(tenantId) {
       if (!loggedOut) {
         console.log(`[${tenantId}] Reconnecting in 5s...`);
         setTimeout(() => {
+          sessions.delete(tenantId);
           startSession(tenantId).catch((err) =>
             console.error(`[${tenantId}] Reconnect failed:`, err.message),
           );
         }, 5000);
       } else {
+        sessions.delete(tenantId);
         console.log(`[${tenantId}] Logged out`);
       }
     }
@@ -185,9 +197,9 @@ async function startSession(tenantId) {
 // ─── Handle incoming WA message ─────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
   const jid = msg.key.remoteJid || "";
-  if (jid.endsWith("@g.us")) return;
+  if (!jid || jid.endsWith("@g.us")) return;
 
-  const phone = jid.replace("@s.whatsapp.net", "").replace(/\D/g, "");
+  const phone = normalizePhone(jid.replace("@s.whatsapp.net", ""));
   const body =
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
@@ -196,17 +208,18 @@ async function handleIncoming(tenantId, msg) {
 
   const rawTimestamp = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
   const ts = new Date(rawTimestamp * 1000).toISOString();
+  const senderName = String(msg.pushName || "").trim() || phone;
 
   await sendWebhook("message", {
     tenant_id: tenantId,
     from: phone,
     body,
-    sender_name: phone,
+    sender_name: senderName,
     created_at: ts,
     wa_message_id: msg.key.id || null,
   });
 
-  console.log(`[${tenantId}] Incoming from ${phone}: ${body.slice(0, 40)}`);
+  console.log(`[${tenantId}] Incoming from ${senderName} (${phone}): ${body.slice(0, 40)}`);
 }
 
 // ─── REST endpoints ─────────────────────────────────────────────────────────
@@ -295,13 +308,17 @@ app.post("/session/send", auth, async (req, res) => {
       return res.status(404).json({ error: "Session not found or not connected" });
     }
 
-    const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
-    await session.sock.sendMessage(jid, { text: message });
+    const cleanPhone = normalizePhone(phone);
+    const jid = cleanPhone.includes("@") ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
+    const result = await session.sock.sendMessage(jid, { text: String(message) });
 
-    res.json({ success: true });
+    return res.json({
+      success: true,
+      message_id: result?.key?.id || null,
+    });
   } catch (err) {
     console.error(`[${req.body?.tenant_id || "unknown"}] Send error:`, err.message);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
