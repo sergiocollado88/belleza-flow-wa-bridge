@@ -46,24 +46,36 @@ function auth(req, res, next) {
 }
 
 // ─── Webhook helper ─────────────────────────────────────────────────────────
-async function sendWebhook(type, payload) {
+async function sendWebhook(event, payload = {}) {
   if (!WA_WEBHOOK_URL) return;
 
   try {
+    const { tenant_id, ...data } = payload;
+
+    if (!tenant_id) {
+      console.error(`Webhook ${event} skipped: missing tenant_id`);
+      return;
+    }
+
     const response = await fetch(WA_WEBHOOK_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-webhook-secret": BRIDGE_API_KEY,
       },
-      body: JSON.stringify({ type, ...payload }),
+      body: JSON.stringify({
+        event,
+        tenant_id,
+        data,
+      }),
     });
 
     if (!response.ok) {
-      console.error(`Webhook ${type} failed: ${response.status}`);
+      const text = await response.text().catch(() => "");
+      console.error(`Webhook ${event} failed: ${response.status} ${text}`);
     }
   } catch (err) {
-    console.error(`Webhook ${type} error:`, err.message);
+    console.error(`Webhook ${event} error:`, err.message);
   }
 }
 
@@ -103,6 +115,7 @@ async function startSession(tenantId) {
 
     if (qr) {
       const qrImage = await QRCode.toDataURL(qr);
+
       if (session) {
         session.status = "qr_pending";
         session.qrCode = qrImage;
@@ -110,8 +123,7 @@ async function startSession(tenantId) {
 
       await sendWebhook("qr_update", {
         tenant_id: tenantId,
-        status: "qr_pending",
-        qr_code: qrImage,
+        qr: qrImage,
       });
 
       console.log(`[${tenantId}] QR updated`);
@@ -119,6 +131,7 @@ async function startSession(tenantId) {
 
     if (connection === "open") {
       const phone = (sock.user?.id || "").split(":")[0].replace(/\D/g, "");
+
       if (session) {
         session.status = "connected";
         session.qrCode = null;
@@ -127,7 +140,6 @@ async function startSession(tenantId) {
 
       await sendWebhook("connected", {
         tenant_id: tenantId,
-        status: "connected",
         phone_number: phone,
       });
 
@@ -142,8 +154,7 @@ async function startSession(tenantId) {
 
       await sendWebhook("disconnected", {
         tenant_id: tenantId,
-        status: loggedOut ? "disconnected" : "reconnecting",
-        logged_out: loggedOut,
+        reconnecting: !loggedOut,
       });
 
       if (!loggedOut) {
@@ -186,13 +197,13 @@ async function handleIncoming(tenantId, msg) {
   const rawTimestamp = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
   const ts = new Date(rawTimestamp * 1000).toISOString();
 
-  await sendWebhook("incoming_message", {
+  await sendWebhook("message", {
     tenant_id: tenantId,
-    phone,
+    from: phone,
     body,
+    sender_name: phone,
     created_at: ts,
     wa_message_id: msg.key.id || null,
-    channel: "whatsapp",
   });
 
   console.log(`[${tenantId}] Incoming from ${phone}: ${body.slice(0, 40)}`);
@@ -206,6 +217,7 @@ app.get("/health", (_req, res) => {
 app.post("/session/start", auth, async (req, res) => {
   try {
     const { tenant_id } = req.body;
+
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id required" });
     }
@@ -238,11 +250,13 @@ app.get("/session/status/:tenantId", auth, (req, res) => {
 app.post("/session/disconnect", auth, async (req, res) => {
   try {
     const { tenant_id } = req.body;
+
     if (!tenant_id) {
       return res.status(400).json({ error: "tenant_id required" });
     }
 
     const session = sessions.get(tenant_id);
+
     if (session?.sock) {
       try {
         await session.sock.logout();
@@ -258,8 +272,7 @@ app.post("/session/disconnect", auth, async (req, res) => {
 
     await sendWebhook("disconnected", {
       tenant_id,
-      status: "disconnected",
-      logged_out: true,
+      reconnecting: false,
     });
 
     res.json({ success: true });
