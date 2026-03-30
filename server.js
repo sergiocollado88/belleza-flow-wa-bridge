@@ -71,6 +71,19 @@ function normalizeJid(value) {
   return digits ? `${digits}@s.whatsapp.net` : null;
 }
 
+function isIgnoredIncomingJid(value) {
+  if (typeof value !== "string") return false;
+  const jid = value.trim().toLowerCase();
+  if (!jid) return false;
+
+  if (jid === "status@broadcast") return true;
+  if (jid.endsWith("@broadcast")) return true;
+  if (jid.endsWith("@newsletter")) return true;
+  if (jid.endsWith("@g.us")) return true;
+
+  return false;
+}
+
 function extractMessageBody(msg) {
   return (
     msg?.message?.conversation ||
@@ -85,42 +98,49 @@ function extractMessageBody(msg) {
 }
 
 function extractRealPhone(msg, tenantId = null) {
-  const candidates = [
+  const explicitCandidates = [
     msg?.key?.participantPn,
     msg?.participantPn,
     msg?.key?.senderPn,
     msg?.senderPn,
-    msg?.key?.remoteJidAlt,
-    msg?.remoteJidAlt,
-    msg?.key?.participantAlt,
-    msg?.participantAlt,
-    msg?.key?.participant,
-    msg?.key?.remoteJid,
+    msg?.phone_number,
+    msg?.phone,
+    msg?.from,
   ];
-  for (const candidate of candidates) {
+
+  for (const candidate of explicitCandidates) {
+    const normalized = normalizePhone(candidate);
+    if (normalized) return normalized;
+  }
+
+  const jidCandidates = [
+    msg?.key?.remoteJid,
+    msg?.key?.participant,
+    msg?.remoteJid,
+    msg?.participant,
+  ];
+
+  for (const candidate of jidCandidates) {
     if (typeof candidate !== "string") continue;
     const trimmed = candidate.trim();
-    if (!trimmed) continue;
     const sNetMatch = trimmed.match(/^(\d+)@s\.whatsapp\.net$/i);
     if (sNetMatch) return sNetMatch[1];
-    if (!trimmed.includes("@")) {
-      const digits = trimmed.replace(/\D/g, "");
-      if (digits) return digits;
-    }
   }
+
   if (tenantId) {
-    const _sess = sessions.get(tenantId);
-    if (_sess?.lidToPhone?.size > 0) {
-      for (const _jid of [msg?.key?.participant, msg?.key?.remoteJid]) {
-        if (typeof _jid !== "string" || !_jid.endsWith("@lid")) continue;
-        const _resolved = _sess.lidToPhone.get(_jid);
-        if (_resolved) {
-          const _m = _resolved.match(/^(\d+)@s\.whatsapp\.net$/i);
-          if (_m) return _m[1];
+    const sess = sessions.get(tenantId);
+    if (sess?.lidToPhone?.size > 0) {
+      for (const jid of [msg?.key?.participant, msg?.key?.remoteJid]) {
+        if (typeof jid !== "string" || !jid.endsWith("@lid")) continue;
+        const resolved = sess.lidToPhone.get(jid);
+        if (resolved) {
+          const m = resolved.match(/^(\d+)@s\.whatsapp\.net$/i);
+          if (m) return m[1];
         }
       }
     }
   }
+
   return null;
 }
 
@@ -261,35 +281,49 @@ async function startSession(tenantId, { forceFresh = false } = {}) {
 
 async function handleIncoming(tenantId, msg) {
   try {
-    // --- ESCUDO ANTI-ESTADOS ---
-    // Si el mensaje viene del canal de estados, lo ignoramos de inmediato
-    if (msg?.key?.remoteJid === "status@broadcast" || msg?.key?.participant === "status@broadcast") {
+    const remoteJid = normalizeJid(msg?.key?.remoteJid);
+    const participantJid = normalizeJid(msg?.key?.participant);
+
+    if (
+      isIgnoredIncomingJid(remoteJid) ||
+      isIgnoredIncomingJid(participantJid)
+    ) {
+      console.log(`[${tenantId}] Ignored status/broadcast/newsletter message`);
       return;
     }
 
-    const remoteJid = normalizeJid(msg?.key?.remoteJid);
-    const participantJid = normalizeJid(msg?.key?.participant);
-    const conversationJid = participantJid || remoteJid;
+    const conversationJid =
+      (typeof remoteJid === "string" && remoteJid.endsWith("@s.whatsapp.net") ? remoteJid : null) ||
+      (typeof participantJid === "string" && participantJid.endsWith("@s.whatsapp.net") ? participantJid : null) ||
+      participantJid ||
+      remoteJid;
 
-    // Doble verificación de escudo
-    if (conversationJid && conversationJid.includes("status@broadcast")) return;
-    if (!conversationJid || conversationJid.endsWith("@g.us")) return;
+    if (!conversationJid) return;
 
     const phone = extractRealPhone(msg, tenantId);
     const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
     const senderName = String(msg?.pushName || "").trim() || phone || conversationJid;
-    
+
     await sendWebhook("message", {
-      tenant_id: tenantId, from: phone, phone, jid: conversationJid,
-      remote_jid: remoteJid, participant_jid: participantJid,
+      tenant_id: tenantId,
+      from: phone,
+      phone,
+      jid: conversationJid,
+      remote_jid: remoteJid,
+      participant_jid: participantJid,
       senderPn: msg?.senderPn || msg?.key?.senderPn || null,
       participantPn: msg?.participantPn || msg?.key?.participantPn || null,
-      body, sender_name: senderName, created_at: ts, wa_message_id: msg?.key?.id || null,
+      body,
+      sender_name: senderName,
+      created_at: ts,
+      wa_message_id: msg?.key?.id || null,
     });
-    
-    console.log(`[${tenantId}] Incoming from ${senderName} (${phone || "sin-phone"}) jid=${conversationJid}: ${String(body).slice(0, 60)}`);
+
+    console.log(
+      `[${tenantId}] Incoming from ${senderName} (${phone || "sin-phone"}) jid=${conversationJid}: ${String(body).slice(0, 60)}`
+    );
   } catch (err) {
     console.error(`[${tenantId}] handleIncoming error:`, err.message);
   }
