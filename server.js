@@ -11,7 +11,7 @@ app.use(express.json());
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;h
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
 
 if (!BRIDGE_API_KEY) {
@@ -48,11 +48,12 @@ function normalizePhone(value) {
   const trimmed = value.trim();
   if (!trimmed) return null;
 
-  const jidMatch = trimmed.match(/^(\d+)@(?:s\.whatsapp\.net|lid|g\.us)$/i);
-  if (jidMatch) return jidMatch[1];
+  const sNetMatch = trimmed.match(/^(\d+)@s\.whatsapp\.net$/i);
+  if (sNetMatch) return sNetMatch[1];
 
-  const beforeColon = trimmed.split(":")[0];
-  const digits = beforeColon.replace(/\D/g, "");
+  if (trimmed.includes("@")) return null;
+
+  const digits = trimmed.replace(/\D/g, "");
   return digits || null;
 }
 
@@ -63,7 +64,7 @@ function normalizeJid(value) {
 
   if (trimmed.includes("@")) return trimmed;
 
-  const digits = normalizePhone(trimmed);
+  const digits = trimmed.replace(/\D/g, "");
   return digits ? `${digits}@s.whatsapp.net` : null;
 }
 
@@ -84,6 +85,37 @@ function ensureSessionsDir() {
   if (!fs.existsSync("./sessions")) {
     fs.mkdirSync("./sessions", { recursive: true });
   }
+}
+
+function extractRealPhone(msg) {
+  const candidates = [
+    msg?.key?.participantPn,
+    msg?.participantPn,
+    msg?.key?.senderPn,
+    msg?.senderPn,
+    msg?.key?.remoteJidAlt,
+    msg?.remoteJidAlt,
+    msg?.key?.participantAlt,
+    msg?.participantAlt,
+    msg?.key?.participant,
+    msg?.key?.remoteJid,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+
+    const sNetMatch = trimmed.match(/^(\d+)@s\.whatsapp\.net$/i);
+    if (sNetMatch) return sNetMatch[1];
+
+    if (!trimmed.includes("@")) {
+      const digits = trimmed.replace(/\D/g, "");
+      if (digits) return digits;
+    }
+  }
+
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +191,6 @@ async function startSession(tenantId) {
     qrCode: null,
     phone: null,
     jid: null,
-  lidToPhone: new Map(),
   };
 
   sessions.set(tenantId, sessionData);
@@ -177,17 +208,6 @@ async function startSession(tenantId) {
 
   sessionData.sock = sock;
   sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("contacts-upsert", (contacts) => {
-    const sess = sessions.get(tenantId);
-    if (!sess) return;
-    sess.lidToPhone = sess.lidToPhone || new Map();
-    for (const contact of contacts) {
-      if (contact.id && contact.lid) {
-        sess.lidToPhone.set(contact.lid, contact.id);
-      }
-    }
-  });
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     const session = sessions.get(tenantId);
@@ -275,29 +295,17 @@ async function startSession(tenantId) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
   try {
-    const session = sessions.get(tenantId);
-    const lidToPhone = session?.lidToPhone || new Map();
-    const rawRemoteJid = msg?.key?.remoteJid;
-    const resolvedRemoteJid = (rawRemoteJid?.endsWith?.("@lid") && lidToPhone.get(rawRemoteJid)) || rawRemoteJid;
-    const remoteJid = normalizeJid(resolvedRemoteJid);
+    const remoteJid = normalizeJid(msg?.key?.remoteJid);
     const participantJid = normalizeJid(msg?.key?.participant);
-    const senderPn = normalizePhone(msg?.senderPn || msg?.key?.senderPn || null);
-    const participantPn = normalizePhone(msg?.participantPn || msg?.key?.participantPn || null);
-
     const conversationJid = participantJid || remoteJid;
+
     if (!conversationJid || conversationJid.endsWith("@g.us")) return;
 
-    const phone =
-      senderPn ||
-      participantPn ||
-      normalizePhone(participantJid) ||
-      normalizePhone(remoteJid) ||
-      null;
-
+    const phone = extractRealPhone(msg);
     const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
-    const senderName = String(msg?.pushName || phone || conversationJid).trim();
+    const senderName = String(msg?.pushName || "").trim() || phone || conversationJid;
 
     await sendWebhook("message", {
       tenant_id: tenantId,
@@ -306,16 +314,16 @@ async function handleIncoming(tenantId, msg) {
       jid: conversationJid,
       remote_jid: remoteJid,
       participant_jid: participantJid,
-      senderPn,
-      participantPn,
+      senderPn: msg?.senderPn || msg?.key?.senderPn || null,
+      participantPn: msg?.participantPn || msg?.key?.participantPn || null,
       body,
-      sender_name: senderName || phone || conversationJid,
+      sender_name: senderName,
       created_at: ts,
       wa_message_id: msg?.key?.id || null,
     });
 
     console.log(
-      `[${tenantId}] Incoming from ${senderName || phone || conversationJid}: ${String(body).slice(0, 60)}`,
+      `[${tenantId}] Incoming from ${senderName} (${phone || "sin-phone"}) jid=${conversationJid}: ${String(body).slice(0, 60)}`,
     );
   } catch (err) {
     console.error(`[${tenantId}] handleIncoming error:`, err.message);
