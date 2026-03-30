@@ -8,7 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Config ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────────────────
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
 
@@ -17,7 +19,9 @@ if (!BRIDGE_API_KEY) {
   process.exit(1);
 }
 
-// ─── Baileys lazy loader (ESM) ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Baileys lazy loader (ESM)
+// ─────────────────────────────────────────────────────────────────────────────
 let baileysCache = null;
 
 async function getBaileys() {
@@ -34,14 +38,57 @@ async function getBaileys() {
   return baileysCache;
 }
 
-// ─── In-memory session store ────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory sessions
+// ─────────────────────────────────────────────────────────────────────────────
 const sessions = new Map();
 
 function normalizePhone(value) {
-  return String(value || "").replace(/\D/g, "");
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const jidMatch = trimmed.match(/^(\d+)@(?:s\.whatsapp\.net|lid|g\.us)$/i);
+  if (jidMatch) return jidMatch[1];
+
+  const beforeColon = trimmed.split(":")[0];
+  const digits = beforeColon.replace(/\D/g, "");
+  return digits || null;
 }
 
-// ─── Auth middleware ────────────────────────────────────────────────────────
+function normalizeJid(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.includes("@")) return trimmed;
+
+  const digits = normalizePhone(trimmed);
+  return digits ? `${digits}@s.whatsapp.net` : null;
+}
+
+function extractMessageBody(msg) {
+  return (
+    msg?.message?.conversation ||
+    msg?.message?.extendedTextMessage?.text ||
+    msg?.message?.imageMessage?.caption ||
+    msg?.message?.videoMessage?.caption ||
+    msg?.message?.documentMessage?.caption ||
+    msg?.message?.buttonsResponseMessage?.selectedDisplayText ||
+    msg?.message?.listResponseMessage?.title ||
+    "[media]"
+  );
+}
+
+function ensureSessionsDir() {
+  if (!fs.existsSync("./sessions")) {
+    fs.mkdirSync("./sessions", { recursive: true });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth
+// ─────────────────────────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (req.headers["x-api-key"] !== BRIDGE_API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -49,7 +96,9 @@ function auth(req, res, next) {
   next();
 }
 
-// ─── Webhook helper ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Webhook helper
+// ─────────────────────────────────────────────────────────────────────────────
 async function sendWebhook(event, payload = {}) {
   if (!WA_WEBHOOK_URL) return;
 
@@ -83,7 +132,9 @@ async function sendWebhook(event, payload = {}) {
   }
 }
 
-// ─── Start / restore a WhatsApp session ────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Start / restore session
+// ─────────────────────────────────────────────────────────────────────────────
 async function startSession(tenantId) {
   const {
     makeWASocket,
@@ -100,7 +151,16 @@ async function startSession(tenantId) {
     return existing;
   }
 
-  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null };
+  ensureSessionsDir();
+
+  const sessionData = {
+    sock: null,
+    status: "starting",
+    qrCode: null,
+    phone: null,
+    jid: null,
+  };
+
   sessions.set(tenantId, sessionData);
 
   const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${tenantId}`);
@@ -137,20 +197,24 @@ async function startSession(tenantId) {
     }
 
     if (connection === "open") {
-      const phone = normalizePhone((sock.user?.id || "").split(":")[0]);
+      const rawSelfId = String(sock.user?.id || "").split(":")[0];
+      const phone = normalizePhone(rawSelfId);
+      const jid = normalizeJid(rawSelfId);
 
       if (session) {
         session.status = "connected";
         session.qrCode = null;
         session.phone = phone;
+        session.jid = jid;
       }
 
       await sendWebhook("connected", {
         tenant_id: tenantId,
         phone_number: phone,
+        jid,
       });
 
-      console.log(`[${tenantId}] Connected — phone: ${phone}`);
+      console.log(`[${tenantId}] Connected — phone: ${phone || "unknown"}`);
     }
 
     if (connection === "close") {
@@ -186,7 +250,7 @@ async function startSession(tenantId) {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (msg.key.fromMe) continue;
+      if (msg?.key?.fromMe) continue;
       await handleIncoming(tenantId, msg);
     }
   });
@@ -194,35 +258,57 @@ async function startSession(tenantId) {
   return sessionData;
 }
 
-// ─── Handle incoming WA message ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Incoming messages
+// ─────────────────────────────────────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
-  const jid = msg.key.remoteJid || "";
-  if (!jid || jid.endsWith("@g.us")) return;
+  try {
+    const remoteJid = normalizeJid(msg?.key?.remoteJid);
+    const participantJid = normalizeJid(msg?.key?.participant);
+    const senderPn = normalizePhone(msg?.senderPn || msg?.key?.senderPn || null);
+    const participantPn = normalizePhone(msg?.participantPn || msg?.key?.participantPn || null);
 
-  const phone = normalizePhone(jid.replace("@s.whatsapp.net", ""));
-  const body =
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    "[media]";
+    const conversationJid = participantJid || remoteJid;
+    if (!conversationJid || conversationJid.endsWith("@g.us")) return;
 
-  const rawTimestamp = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
-  const ts = new Date(rawTimestamp * 1000).toISOString();
-  const senderName = String(msg.pushName || "").trim() || phone;
+    const phone =
+      senderPn ||
+      participantPn ||
+      normalizePhone(participantJid) ||
+      normalizePhone(remoteJid) ||
+      null;
 
-  await sendWebhook("message", {
-    tenant_id: tenantId,
-    from: phone,
-    body,
-    sender_name: senderName,
-    created_at: ts,
-    wa_message_id: msg.key.id || null,
-  });
+    const body = extractMessageBody(msg);
+    const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
+    const ts = new Date(rawTimestamp * 1000).toISOString();
+    const senderName = String(msg?.pushName || phone || conversationJid).trim();
 
-  console.log(`[${tenantId}] Incoming from ${senderName} (${phone}): ${body.slice(0, 40)}`);
+    await sendWebhook("message", {
+      tenant_id: tenantId,
+      from: phone,
+      phone,
+      jid: conversationJid,
+      remote_jid: remoteJid,
+      participant_jid: participantJid,
+      senderPn,
+      participantPn,
+      body,
+      sender_name: senderName || phone || conversationJid,
+      created_at: ts,
+      wa_message_id: msg?.key?.id || null,
+    });
+
+    console.log(
+      `[${tenantId}] Incoming from ${senderName || phone || conversationJid}: ${String(body).slice(0, 60)}`,
+    );
+  } catch (err) {
+    console.error(`[${tenantId}] handleIncoming error:`, err.message);
+  }
 }
 
-// ─── REST endpoints ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// REST
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({ ok: true, sessions: sessions.size });
 });
@@ -237,26 +323,28 @@ app.post("/session/start", auth, async (req, res) => {
 
     const session = await startSession(tenant_id);
 
-    res.json({
+    return res.json({
       success: true,
       status: session?.status || "starting",
       qr_code: session?.qrCode || null,
       phone: session?.phone || null,
+      jid: session?.jid || null,
     });
   } catch (err) {
     console.error("/session/start error:", err.message);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/session/status/:tenantId", auth, (req, res) => {
   const session = sessions.get(req.params.tenantId);
 
-  res.json({
+  return res.json({
     connected: session?.status === "connected",
     status: session?.status || "disconnected",
     qr_code: session?.qrCode || null,
     phone: session?.phone || null,
+    jid: session?.jid || null,
   });
 });
 
@@ -288,19 +376,19 @@ app.post("/session/disconnect", auth, async (req, res) => {
       reconnecting: false,
     });
 
-    res.json({ success: true });
+    return res.json({ success: true });
   } catch (err) {
     console.error("/session/disconnect error:", err.message);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
 app.post("/session/send", auth, async (req, res) => {
   try {
-    const { tenant_id, phone, message } = req.body;
+    const { tenant_id, phone, recipient_jid, message } = req.body;
 
-    if (!tenant_id || !phone || !message) {
-      return res.status(400).json({ error: "tenant_id, phone, message required" });
+    if (!tenant_id || !message) {
+      return res.status(400).json({ error: "tenant_id and message required" });
     }
 
     const session = sessions.get(tenant_id);
@@ -308,12 +396,21 @@ app.post("/session/send", auth, async (req, res) => {
       return res.status(404).json({ error: "Session not found or not connected" });
     }
 
-    const cleanPhone = normalizePhone(phone);
-    const jid = cleanPhone.includes("@") ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
+    let jid = normalizeJid(recipient_jid);
+
+    if (!jid) {
+      const cleanPhone = normalizePhone(phone);
+      if (!cleanPhone) {
+        return res.status(400).json({ error: "phone or recipient_jid required" });
+      }
+      jid = `${cleanPhone}@s.whatsapp.net`;
+    }
+
     const result = await session.sock.sendMessage(jid, { text: String(message) });
 
     return res.json({
       success: true,
+      jid,
       message_id: result?.key?.id || null,
     });
   } catch (err) {
@@ -322,12 +419,11 @@ app.post("/session/send", auth, async (req, res) => {
   }
 });
 
-// ─── On startup: restore sessions from filesystem ─────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Restore sessions
+// ─────────────────────────────────────────────────────────────────────────────
 async function restoreActiveSessions() {
-  if (!fs.existsSync("./sessions")) {
-    fs.mkdirSync("./sessions", { recursive: true });
-    return;
-  }
+  ensureSessionsDir();
 
   const dirs = fs.readdirSync("./sessions").filter((d) => {
     try {
