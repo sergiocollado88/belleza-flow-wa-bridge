@@ -88,7 +88,7 @@ function extractMessageBody(msg) {
   );
 }
 
-function extractRealPhone(msg) {
+function extractRealPhone(msg, tenantId = null) {
   const candidates = [
     msg?.key?.participantPn,
     msg?.participantPn,
@@ -113,6 +113,22 @@ function extractRealPhone(msg) {
     if (!trimmed.includes("@")) {
       const digits = trimmed.replace(/\D/g, "");
       if (digits) return digits;
+    }
+  }
+
+
+  // LID resolution: look up in session's contact map
+  if (tenantId) {
+    const _sess = sessions.get(tenantId);
+    if (_sess?.lidToPhone?.size > 0) {
+      for (const _jid of [msg?.key?.participant, msg?.key?.remoteJid]) {
+        if (typeof _jid !== "string" || !_jid.endsWith("@lid")) continue;
+        const _resolved = _sess.lidToPhone.get(_jid);
+        if (_resolved) {
+          const _m = _resolved.match(/^(\d+)@s\.whatsapp\.net$/i);
+          if (_m) return _m[1];
+        }
+      }
     }
   }
 
@@ -208,6 +224,7 @@ async function startSession(tenantId, { forceFresh = false } = {}) {
     phone: null,
     jid: null,
     startedAt: Date.now(),
+    lidToPhone: new Map(),
   };
 
   sessions.set(tenantId, sessionData);
@@ -225,6 +242,20 @@ async function startSession(tenantId, { forceFresh = false } = {}) {
 
   sessionData.sock = sock;
   sock.ev.on("creds.update", saveCreds);
+
+  // Build LID→phone map from WhatsApp contact sync (fixes privacy LID JIDs)
+  const _syncContacts = (contacts) => {
+    const sess = sessions.get(tenantId);
+    if (!sess) return;
+    sess.lidToPhone = sess.lidToPhone || new Map();
+    for (const c of contacts || []) {
+      if (c.id && c.lid) {
+        sess.lidToPhone.set(c.lid, c.id);
+      }
+    }
+  };
+  sock.ev.on("contacts-set", ({ contacts }) => _syncContacts(contacts));
+  sock.ev.on("contacts-upsert", (contacts) => _syncContacts(contacts));
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     const current = sessions.get(tenantId);
@@ -317,7 +348,7 @@ async function handleIncoming(tenantId, msg) {
 
     if (!conversationJid || conversationJid.endsWith("@g.us")) return;
 
-    const phone = extractRealPhone(msg);
+    const phone = extractRealPhone(msg, tenantId);
     const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
@@ -421,6 +452,20 @@ app.post("/session/send", auth, async (req, res) => {
     const session = sessions.get(tenant_id);
     if (!session?.sock || session.status !== "connected") {
       return res.status(404).json({ error: "Session not found or not connected" });
+    }
+
+    // Resolve LID-stored phone numbers back to real phone
+    let _resolvedPhone = phone;
+    if (_resolvedPhone) {
+      const _sendSess = sessions.get(tenant_id);
+      if (_sendSess?.lidToPhone?.size > 0) {
+        const _possLid = `${_resolvedPhone}@lid`;
+        const _res = _sendSess.lidToPhone.get(_possLid);
+        if (_res) {
+          const _rm = _res.match(/^(\d+)@s\.whatsapp\.net$/i);
+          if (_rm) _resolvedPhone = _rm[1];
+        }
+      }
     }
 
     let jid = normalizeJid(recipient_jid);
