@@ -11,7 +11,7 @@ app.use(express.json());
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;h
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
 
 if (!BRIDGE_API_KEY) {
@@ -159,6 +159,7 @@ async function startSession(tenantId) {
     qrCode: null,
     phone: null,
     jid: null,
+  lidToPhone: new Map(),
   };
 
   sessions.set(tenantId, sessionData);
@@ -176,6 +177,17 @@ async function startSession(tenantId) {
 
   sessionData.sock = sock;
   sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("contacts-upsert", (contacts) => {
+    const sess = sessions.get(tenantId);
+    if (!sess) return;
+    sess.lidToPhone = sess.lidToPhone || new Map();
+    for (const contact of contacts) {
+      if (contact.id && contact.lid) {
+        sess.lidToPhone.set(contact.lid, contact.id);
+      }
+    }
+  });
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     const session = sessions.get(tenantId);
@@ -263,7 +275,11 @@ async function startSession(tenantId) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
   try {
-    const remoteJid = normalizeJid(msg?.key?.remoteJid);
+    const session = sessions.get(tenantId);
+    const lidToPhone = session?.lidToPhone || new Map();
+    const rawRemoteJid = msg?.key?.remoteJid;
+    const resolvedRemoteJid = (rawRemoteJid?.endsWith?.("@lid") && lidToPhone.get(rawRemoteJid)) || rawRemoteJid;
+    const remoteJid = normalizeJid(resolvedRemoteJid);
     const participantJid = normalizeJid(msg?.key?.participant);
     const senderPn = normalizePhone(msg?.senderPn || msg?.key?.senderPn || null);
     const participantPn = normalizePhone(msg?.participantPn || msg?.key?.participantPn || null);
