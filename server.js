@@ -8,9 +8,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────────────────────────────────────
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
 
@@ -19,9 +16,6 @@ if (!BRIDGE_API_KEY) {
   process.exit(1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Baileys lazy loader (ESM)
-// ─────────────────────────────────────────────────────────────────────────────
 let baileysCache = null;
 
 async function getBaileys() {
@@ -34,14 +28,27 @@ async function getBaileys() {
       fetchLatestBaileysVersion: mod.fetchLatestBaileysVersion,
     };
   }
-
   return baileysCache;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// In-memory sessions
-// ─────────────────────────────────────────────────────────────────────────────
 const sessions = new Map();
+
+function ensureSessionsDir() {
+  if (!fs.existsSync("./sessions")) {
+    fs.mkdirSync("./sessions", { recursive: true });
+  }
+}
+
+function sessionPath(tenantId) {
+  return `./sessions/${tenantId}`;
+}
+
+function removeSessionFiles(tenantId) {
+  const path = sessionPath(tenantId);
+  if (fs.existsSync(path)) {
+    fs.rmSync(path, { recursive: true, force: true });
+  }
+}
 
 function normalizePhone(value) {
   if (typeof value !== "string") return null;
@@ -81,12 +88,6 @@ function extractMessageBody(msg) {
   );
 }
 
-function ensureSessionsDir() {
-  if (!fs.existsSync("./sessions")) {
-    fs.mkdirSync("./sessions", { recursive: true });
-  }
-}
-
 function extractRealPhone(msg) {
   const candidates = [
     msg?.key?.participantPn,
@@ -118,9 +119,6 @@ function extractRealPhone(msg) {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auth
-// ─────────────────────────────────────────────────────────────────────────────
 function auth(req, res, next) {
   if (req.headers["x-api-key"] !== BRIDGE_API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -128,9 +126,6 @@ function auth(req, res, next) {
   next();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Webhook helper
-// ─────────────────────────────────────────────────────────────────────────────
 async function sendWebhook(event, payload = {}) {
   if (!WA_WEBHOOK_URL) return;
 
@@ -164,10 +159,27 @@ async function sendWebhook(event, payload = {}) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Start / restore session
-// ─────────────────────────────────────────────────────────────────────────────
-async function startSession(tenantId) {
+async function destroySession(tenantId, { removeFiles = false } = {}) {
+  const existing = sessions.get(tenantId);
+
+  if (existing?.sock) {
+    try {
+      await existing.sock.logout();
+    } catch (_) {}
+
+    try {
+      existing.sock.ws?.close?.();
+    } catch (_) {}
+  }
+
+  sessions.delete(tenantId);
+
+  if (removeFiles) {
+    removeSessionFiles(tenantId);
+  }
+}
+
+async function startSession(tenantId, { forceFresh = false } = {}) {
   const {
     makeWASocket,
     useMultiFileAuthState,
@@ -176,11 +188,15 @@ async function startSession(tenantId) {
   } = await getBaileys();
 
   const existing = sessions.get(tenantId);
-  if (
-    existing &&
-    ["connected", "starting", "qr_pending", "reconnecting"].includes(existing.status)
-  ) {
-    return existing;
+
+  if (!forceFresh && existing) {
+    if (existing.status === "connected") return existing;
+    if (existing.status === "qr_pending") return existing;
+    if (existing.status === "starting") return existing;
+  }
+
+  if (forceFresh) {
+    await destroySession(tenantId, { removeFiles: true });
   }
 
   ensureSessionsDir();
@@ -191,11 +207,12 @@ async function startSession(tenantId) {
     qrCode: null,
     phone: null,
     jid: null,
+    startedAt: Date.now(),
   };
 
   sessions.set(tenantId, sessionData);
 
-  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${tenantId}`);
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -210,15 +227,14 @@ async function startSession(tenantId) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    const session = sessions.get(tenantId);
+    const current = sessions.get(tenantId);
+    if (!current || current.sock !== sock) return;
 
     if (qr) {
       const qrImage = await QRCode.toDataURL(qr);
 
-      if (session) {
-        session.status = "qr_pending";
-        session.qrCode = qrImage;
-      }
+      current.status = "qr_pending";
+      current.qrCode = qrImage;
 
       await sendWebhook("qr_update", {
         tenant_id: tenantId,
@@ -233,12 +249,10 @@ async function startSession(tenantId) {
       const phone = normalizePhone(rawSelfId);
       const jid = normalizeJid(rawSelfId);
 
-      if (session) {
-        session.status = "connected";
-        session.qrCode = null;
-        session.phone = phone;
-        session.jid = jid;
-      }
+      current.status = "connected";
+      current.qrCode = null;
+      current.phone = phone;
+      current.jid = jid;
 
       await sendWebhook("connected", {
         tenant_id: tenantId,
@@ -253,28 +267,33 @@ async function startSession(tenantId) {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
 
-      if (session) {
-        session.status = loggedOut ? "disconnected" : "reconnecting";
-        session.qrCode = null;
-      }
+      current.status = loggedOut ? "disconnected" : "reconnecting";
+      current.qrCode = null;
 
       await sendWebhook("disconnected", {
         tenant_id: tenantId,
         reconnecting: !loggedOut,
       });
 
-      if (!loggedOut) {
-        console.log(`[${tenantId}] Reconnecting in 5s...`);
-        setTimeout(() => {
-          sessions.delete(tenantId);
-          startSession(tenantId).catch((err) =>
-            console.error(`[${tenantId}] Reconnect failed:`, err.message),
-          );
-        }, 5000);
-      } else {
-        sessions.delete(tenantId);
+      if (loggedOut) {
+        await destroySession(tenantId, { removeFiles: true });
         console.log(`[${tenantId}] Logged out`);
+        return;
       }
+
+      console.log(`[${tenantId}] Reconnecting in 5s...`);
+      setTimeout(async () => {
+        const latest = sessions.get(tenantId);
+        if (!latest || latest.sock !== sock) return;
+
+        sessions.delete(tenantId);
+
+        try {
+          await startSession(tenantId, { forceFresh: false });
+        } catch (err) {
+          console.error(`[${tenantId}] Reconnect failed:`, err.message);
+        }
+      }, 5000);
     }
   });
 
@@ -290,9 +309,6 @@ async function startSession(tenantId) {
   return sessionData;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Incoming messages
-// ─────────────────────────────────────────────────────────────────────────────
 async function handleIncoming(tenantId, msg) {
   try {
     const remoteJid = normalizeJid(msg?.key?.remoteJid);
@@ -330,9 +346,6 @@ async function handleIncoming(tenantId, msg) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// REST
-// ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({ ok: true, sessions: sessions.size });
 });
@@ -345,7 +358,10 @@ app.post("/session/start", auth, async (req, res) => {
       return res.status(400).json({ error: "tenant_id required" });
     }
 
-    const session = await startSession(tenant_id);
+    const existing = sessions.get(tenant_id);
+    const forceFresh = !existing || existing.status !== "connected";
+
+    const session = await startSession(tenant_id, { forceFresh });
 
     return res.json({
       success: true,
@@ -380,20 +396,7 @@ app.post("/session/disconnect", auth, async (req, res) => {
       return res.status(400).json({ error: "tenant_id required" });
     }
 
-    const session = sessions.get(tenant_id);
-
-    if (session?.sock) {
-      try {
-        await session.sock.logout();
-      } catch (_) {}
-    }
-
-    sessions.delete(tenant_id);
-
-    const path = `./sessions/${tenant_id}`;
-    if (fs.existsSync(path)) {
-      fs.rmSync(path, { recursive: true, force: true });
-    }
+    await destroySession(tenant_id, { removeFiles: true });
 
     await sendWebhook("disconnected", {
       tenant_id,
@@ -443,9 +446,6 @@ app.post("/session/send", auth, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Restore sessions
-// ─────────────────────────────────────────────────────────────────────────────
 async function restoreActiveSessions() {
   ensureSessionsDir();
 
@@ -459,7 +459,7 @@ async function restoreActiveSessions() {
 
   for (const tenantId of dirs) {
     console.log(`Restoring session: ${tenantId}`);
-    startSession(tenantId).catch((err) =>
+    startSession(tenantId, { forceFresh: false }).catch((err) =>
       console.error(`Failed to restore ${tenantId}:`, err.message),
     );
   }
