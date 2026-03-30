@@ -1,7 +1,7 @@
 // Supabase Edge Function: whatsapp-webhook
 // Called BY the wa-bridge server on Railway when:
-//   - Session status changes (QR code, connected, disconnected)
-//   - New incoming WhatsApp message
+// - Session status changes (QR code, connected, disconnected)
+// - New incoming WhatsApp message
 // Deploy with: supabase functions deploy whatsapp-webhook
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -21,10 +21,11 @@ serve(async (req) => {
 
   try {
     const payload = await req.json();
-    const { type, tenant_id } = payload;
+    // Bridge sends: { event, tenant_id, data }
+    const { event: type, tenant_id, data = {} } = payload;
 
     if (!type || !tenant_id) {
-      return new Response(JSON.stringify({ error: "type and tenant_id required" }), {
+      return new Response(JSON.stringify({ error: "event and tenant_id required" }), {
         status: 400,
         headers: { "Content-Type": "application/json" },
       });
@@ -32,22 +33,45 @@ serve(async (req) => {
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
+    // ── Session status events ────────────────────────────────────────────────
     if (type === "qr_update" || type === "connected" || type === "disconnected") {
+      const statusMap: Record<string, string> = {
+        qr_update: "qr_pending",
+        connected: "connected",
+        disconnected: (data as any).reconnecting ? "reconnecting" : "disconnected",
+      };
+
       await supabase.from("whatsapp_sessions").upsert(
         {
           tenant_id,
-          status: payload.status,
-          qr_code: payload.qr_code || null,
-          phone_number: payload.phone_number || null,
+          status: statusMap[type] || type,
+          qr_code: (data as any).qr || null,
+          phone_number: (data as any).phone_number || null,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "tenant_id" }
       );
-      console.log(`[${tenant_id}] Session status: ${payload.status}`);
+      console.log(`[${tenant_id}] Session event: ${type}`);
     }
 
-    if (type === "incoming_message") {
-      const { phone, body, created_at, wa_message_id, channel } = payload;
+    // ── Incoming WhatsApp message ─────────────────────────────────────────────
+    // Bridge sends event = "message" (not "incoming_message")
+    if (type === "message") {
+      const {
+        phone,
+        body,
+        sender_name,
+        created_at,
+        wa_message_id,
+        channel,
+      } = data as any;
+
+      if (!phone || !body) {
+        console.warn(`[${tenant_id}] Skipping message: missing phone or body`);
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
 
       let { data: conv } = await supabase
         .from("conversations")
@@ -64,11 +88,11 @@ serve(async (req) => {
             tenant_id,
             phone,
             channel: channel || "whatsapp",
-            contact_name: phone,
+            contact_name: sender_name || phone,
             status: "nuevo",
             unread_count: 1,
             last_message_at: created_at,
-            last_message_preview: body.slice(0, 120),
+            last_message_preview: String(body).slice(0, 120),
           })
           .select("id, unread_count")
           .single();
@@ -79,7 +103,7 @@ serve(async (req) => {
           .update({
             unread_count: (conv.unread_count || 0) + 1,
             last_message_at: created_at,
-            last_message_preview: body.slice(0, 120),
+            last_message_preview: String(body).slice(0, 120),
           })
           .eq("id", conv.id);
       }
@@ -87,14 +111,14 @@ serve(async (req) => {
       if (conv?.id) {
         await supabase.from("messages").insert({
           conversation_id: conv.id,
-          body,
+          body: String(body),
           direction: "inbound",
           channel: channel || "whatsapp",
           created_at,
           status: "received",
           wa_message_id: wa_message_id || null,
         });
-        console.log(`[${tenant_id}] Saved incoming from ${phone}: ${body.slice(0, 40)}`);
+        console.log(`[${tenant_id}] Saved incoming from ${sender_name || phone}: ${String(body).slice(0, 40)}`);
       }
     }
 
