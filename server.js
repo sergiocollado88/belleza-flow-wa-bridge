@@ -1,3 +1,4 @@
+// v2 - LID phone resolution fix
 const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
