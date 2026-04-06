@@ -1,4 +1,4 @@
-// v3 - Fix outbound LID resolution + persistent session restore + Anti-Status Shield
+// v4 - Added Multimedia Support (Base64 Extraction for Lovable)
 const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
@@ -7,7 +7,8 @@ const fs = require("fs");
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
@@ -27,6 +28,7 @@ async function getBaileys() {
       useMultiFileAuthState: mod.useMultiFileAuthState,
       DisconnectReason: mod.DisconnectReason,
       fetchLatestBaileysVersion: mod.fetchLatestBaileysVersion,
+      downloadMediaMessage: mod.downloadMediaMessage
     };
   }
   return baileysCache;
@@ -306,6 +308,49 @@ async function handleIncoming(tenantId, msg) {
     const ts = new Date(rawTimestamp * 1000).toISOString();
     const senderName = String(msg?.pushName || "").trim() || phone || conversationJid;
 
+    // --- NUEVO COMPONENTE: EXTRACCIÓN DE FOTOS Y AUDIO (BASE64) ---
+    let mediaBase64 = null;
+    let mimetype = null;
+    let messageType = "conversation";
+
+    if (msg.message?.imageMessage) {
+      messageType = "imageMessage";
+      mimetype = msg.message.imageMessage.mimetype;
+    } else if (msg.message?.audioMessage) {
+      messageType = "audioMessage";
+      mimetype = msg.message.audioMessage.mimetype;
+    } else if (msg.message?.videoMessage) {
+      messageType = "videoMessage";
+      mimetype = msg.message.videoMessage.mimetype;
+    } else if (msg.message?.documentMessage) {
+      messageType = "documentMessage";
+      mimetype = msg.message.documentMessage.mimetype;
+    }
+
+    if (mimetype && sessions.has(tenantId)) {
+      try {
+        const { downloadMediaMessage } = await getBaileys();
+        const sock = sessions.get(tenantId).sock;
+        const logger = P({ level: "silent" });
+        
+        // Descargamos la foto/voz desencriptada desde WhatsApp
+        const buffer = await downloadMediaMessage(
+          msg,
+          "buffer",
+          {},
+          { logger, reuploadRequest: sock.updateMediaMessage }
+        );
+        
+        // Convertir a base64 para enviarlo limpio a tu CRM
+        if (buffer) {
+          mediaBase64 = buffer.toString("base64");
+        }
+      } catch (err) {
+        console.error(`[${tenantId}] Error extrayendo multimedia:`, err.message);
+      }
+    }
+    // --------------------------------------------------------------
+
     await sendWebhook("message", {
       tenant_id: tenantId,
       from: phone,
@@ -319,6 +364,12 @@ async function handleIncoming(tenantId, msg) {
       sender_name: senderName,
       created_at: ts,
       wa_message_id: msg?.key?.id || null,
+      // INYECCIÓN DE LA FOTO PARA SUPABASE:
+      message: {
+        base64: mediaBase64,
+        mimetype: mimetype || null,
+        messageType: messageType
+      }
     });
 
     console.log(
@@ -373,16 +424,12 @@ app.post("/session/send", auth, async (req, res) => {
       return res.status(404).json({ error: "Session not found or not connected" });
     }
 
-    // --- CORRECCIÓN DEL ENVÍO ---
-    // En lugar de hacer resoluciones complejas que fallan, limpiamos matemáticamente el número.
     let jid = null;
     const target = recipient_jid || phone;
 
     if (target) {
-      // Reemplaza todo lo que no sea un número (quita espacios, signos +, guiones)
       const justNumbers = String(target).replace(/\D/g, "");
       if (justNumbers) {
-        // Le forzamos el sufijo exacto que necesita el servidor de WhatsApp
         jid = `${justNumbers}@s.whatsapp.net`;
       }
     }
