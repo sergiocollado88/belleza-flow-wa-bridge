@@ -4,6 +4,7 @@ const cors = require("cors");
 const QRCode = require("qrcode");
 const P = require("pino");
 const fs = require("fs");
+const path = require("path");
 const app = express();
 
 app.use(cors());
@@ -12,7 +13,13 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
+const BRIDGE_PUBLIC_URL =
+  process.env.BRIDGE_PUBLIC_URL ||
+  (process.env.RAILWAY_STATIC_URL ? `https://${process.env.RAILWAY_STATIC_URL}` : null) ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null);
 
+const MEDIA_CACHE_ROOT = "./media-cache";
+const MEDIA_CACHE_TTL_MS = 72 * 60 * 60 * 1000;
 if (!BRIDGE_API_KEY) {
   console.error("BRIDGE_API_KEY env var is required");
   process.exit(1);
@@ -42,6 +49,53 @@ function ensureSessionsDir() {
   }
 }
 
+function ensureMediaCacheDir(tenantId) {
+  if (!fs.existsSync(MEDIA_CACHE_ROOT)) {
+    fs.mkdirSync(MEDIA_CACHE_ROOT, { recursive: true });
+  }
+
+  const tenantDir = path.join(MEDIA_CACHE_ROOT, tenantId);
+  if (!fs.existsSync(tenantDir)) {
+    fs.mkdirSync(tenantDir, { recursive: true });
+  }
+
+  return tenantDir;
+}
+
+function mediaExtensionFromMimeType(mimetype) {
+  const normalized = String(mimetype || "").toLowerCase();
+
+  if (normalized.includes("ogg")) return "ogg";
+  if (normalized.includes("mpeg") || normalized.includes("mp3")) return "mp3";
+  if (normalized.includes("wav")) return "wav";
+  if (normalized.includes("mp4")) return normalized.startsWith("audio/") ? "m4a" : "mp4";
+  if (normalized.includes("webm")) return "webm";
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return "jpg";
+  if (normalized.includes("png")) return "png";
+  if (normalized.includes("gif")) return "gif";
+  if (normalized.includes("webp")) return "webp";
+  if (normalized.includes("pdf")) return "pdf";
+
+  return "bin";
+}
+
+function buildBridgeMediaUrl(tenantId, messageId, mimetype, buffer) {
+  if (!BRIDGE_PUBLIC_URL || !messageId || !buffer?.length) return null;
+
+  try {
+    const tenantDir = ensureMediaCacheDir(tenantId);
+    const extension = mediaExtensionFromMimeType(mimetype);
+    const fileName = `${messageId}.${extension}`;
+    const filePath = path.join(tenantDir, fileName);
+
+    fs.writeFileSync(filePath, buffer);
+
+    return `${BRIDGE_PUBLIC_URL}/media/${encodeURIComponent(tenantId)}/${encodeURIComponent(fileName)}`;
+  } catch (err) {
+    console.error(`[${tenantId}] Error guardando media-cache:`, err.message);
+    return null;
+  }
+}
 function sessionPath(tenantId) {
   return `./sessions/${tenantId}`;
 }
@@ -312,6 +366,7 @@ async function handleIncoming(tenantId, msg) {
     let mediaBase64 = null;
     let mimetype = null;
     let messageType = "conversation";
+    let bridgeMediaUrl = null;
 
     if (msg.message?.imageMessage) {
       messageType = "imageMessage";
@@ -344,6 +399,12 @@ async function handleIncoming(tenantId, msg) {
         // Convertir a base64 para enviarlo limpio a tu CRM
         if (buffer) {
           mediaBase64 = buffer.toString("base64");
+          bridgeMediaUrl = buildBridgeMediaUrl(
+            tenantId,
+            msg?.key?.id || `media_${Date.now()}`,
+            mimetype,
+            buffer
+          );
         }
       } catch (err) {
         console.error(`[${tenantId}] Error extrayendo multimedia:`, err.message);
@@ -364,7 +425,9 @@ async function handleIncoming(tenantId, msg) {
       sender_name: senderName,
       created_at: ts,
       wa_message_id: msg?.key?.id || null,
-      // INYECCIÓN DE LA FOTO PARA SUPABASE:
+      download_url: bridgeMediaUrl,
+      media_url: bridgeMediaUrl,
+      mimetype: mimetype || null,
       message: {
         base64: mediaBase64,
         mimetype: mimetype || null,
@@ -381,6 +444,52 @@ async function handleIncoming(tenantId, msg) {
 }
 
 app.get("/health", (_req, res) => { res.json({ ok: true, sessions: sessions.size }); });
+app.get("/media/:tenantId/:fileName", (req, res) => {
+  try {
+    const tenantId = String(req.params.tenantId || "").trim();
+    const fileName = path.basename(String(req.params.fileName || "").trim());
+
+    if (!tenantId || !fileName) {
+      return res.status(400).json({ error: "Invalid media path" });
+    }
+
+    const filePath = path.join(MEDIA_CACHE_ROOT, tenantId, fileName);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "Media not found" });
+    }
+
+    const stats = fs.statSync(filePath);
+    if (Date.now() - stats.mtimeMs > MEDIA_CACHE_TTL_MS) {
+      try { fs.unlinkSync(filePath); } catch (_) {}
+      return res.status(410).json({ error: "Media expired" });
+    }
+
+    const ext = path.extname(fileName).toLowerCase();
+    const mimeByExt = {
+      ".ogg": "audio/ogg",
+      ".opus": "audio/ogg",
+      ".mp3": "audio/mpeg",
+      ".wav": "audio/wav",
+      ".m4a": "audio/mp4",
+      ".mp4": "video/mp4",
+      ".webm": "video/webm",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".pdf": "application/pdf",
+    };
+
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.type(mimeByExt[ext] || "application/octet-stream");
+    return res.sendFile(path.resolve(filePath));
+  } catch (err) {
+    console.error("/media error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 app.post("/session/start", auth, async (req, res) => {
   try {
