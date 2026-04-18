@@ -275,7 +275,7 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
   if (forceFresh) await destroySession(tenantId, { removeFiles: true });
   ensureSessionsDir();
   
-  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts, msgCache: new Map() };
+  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts, msgCache: new Map(), sendQueues: new Map() };
   sessions.set(tenantId, sessionData);
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
@@ -643,15 +643,25 @@ app.post("/session/send", auth, async (req, res) => {
 
     if (!jid) return res.status(400).json({ error: "phone or recipient_jid required" });
 
-    console.log(`[${tenant_id}] Sending out to mathematically cleaned jid=${jid}`);
-    const result = await session.sock.sendMessage(jid, { text: String(message) });
-    if (result?.key?.id && session.msgCache) {
-      session.msgCache.set(result.key.id, { conversation: String(message) });
-      if (session.msgCache.size > 1000) {
-        const firstKey = session.msgCache.keys().next().value;
-        session.msgCache.delete(firstKey);
+    console.log(`[${tenant_id}] Queuing send to jid=${jid}`);
+
+    // Serialize sends per JID with a 600ms cooldown to avoid burst retries
+    const prev = (session.sendQueues.get(jid) || Promise.resolve()).catch(() => {});
+    const task = prev.then(async () => {
+      const r = await session.sock.sendMessage(jid, { text: String(message) });
+      if (r?.key?.id && session.msgCache) {
+        session.msgCache.set(r.key.id, { conversation: String(message) });
+        if (session.msgCache.size > 1000) {
+          const firstKey = session.msgCache.keys().next().value;
+          session.msgCache.delete(firstKey);
+        }
       }
-    }
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      return r;
+    });
+    session.sendQueues.set(jid, task.catch(() => {}));
+
+    const result = await task;
     return res.json({ success: true, jid, message_id: result?.key?.id || null });
   } catch (err) {
     console.error(`[${req.body?.tenant_id || "unknown"}] Send error:`, err.message);
