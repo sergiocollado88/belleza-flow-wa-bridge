@@ -20,6 +20,7 @@ const BRIDGE_PUBLIC_URL =
 
 const MEDIA_CACHE_ROOT = "./media-cache";
 const MEDIA_CACHE_TTL_MS = 72 * 60 * 60 * 1000;
+const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
 if (!BRIDGE_API_KEY) {
   console.error("BRIDGE_API_KEY env var is required");
   process.exit(1);
@@ -41,11 +42,22 @@ async function getBaileys() {
   return baileysCache;
 }
 
+let waVersionCache = null;
+async function getWAVersion() {
+  if (!waVersionCache) {
+    const { fetchLatestBaileysVersion } = await getBaileys();
+    const { version } = await fetchLatestBaileysVersion();
+    waVersionCache = version;
+    console.log(`[bridge] WA version pinned: ${version.join(".")}`);
+  }
+  return waVersionCache;
+}
+
 const sessions = new Map();
 
 function ensureSessionsDir() {
-  if (!fs.existsSync("./sessions")) {
-    fs.mkdirSync("./sessions", { recursive: true });
+  if (!fs.existsSync(SESSIONS_DIR)) {
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
   }
 }
 
@@ -107,7 +119,7 @@ function isValidTenantId(name) {
 }
 
 function sessionPath(tenantId) {
-  return `./sessions/${tenantId}`;
+  return path.join(SESSIONS_DIR, String(tenantId));
 }
 
 function removeSessionFiles(tenantId) {
@@ -253,7 +265,7 @@ async function destroySession(tenantId, { removeFiles = false } = {}) {
 }
 
 async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 0 } = {}) {
-  const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = await getBaileys();
+  const { makeWASocket, useMultiFileAuthState, DisconnectReason } = await getBaileys();
   const existing = sessions.get(tenantId);
   if (!forceFresh && existing) {
     if (existing.status === "connected") return existing;
@@ -267,9 +279,18 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
   sessions.set(tenantId, sessionData);
   
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
-  const { version } = await fetchLatestBaileysVersion();
-  
-  const sock = makeWASocket({ version, auth: state, logger: P({ level: "silent" }), printQRInTerminal: false, browser: ["Belleza Flow", "Chrome", "1.0"] });
+  const version = await getWAVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: P({ level: "silent" }),
+    printQRInTerminal: false,
+    browser: ["Chrome (Linux)", "Chrome", "120.0.0"],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+  });
   sessionData.sock = sock;
   
   sock.ev.on("creds.update", saveCreds);
@@ -320,6 +341,16 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
       if (loggedOut) {
         await destroySession(tenantId, { removeFiles: true });
         console.log(`[${tenantId}] Logged out`);
+        return;
+      }
+
+      const isBadSession = code === DisconnectReason.badSession;
+      const isReplaced   = code === DisconnectReason.connectionReplaced;
+      if (isBadSession || isReplaced) {
+        const reason = isBadSession ? "bad_session" : "connection_replaced";
+        console.error(`[${tenantId}] Fatal disconnect (${code} – ${reason}) — removing session files`);
+        await destroySession(tenantId, { removeFiles: true });
+        await sendWebhook("disconnected", { tenant_id: tenantId, reconnecting: false, reason });
         return;
       }
 
@@ -530,6 +561,38 @@ app.get("/session/status/:tenantId", auth, (req, res) => {
   return res.json({ connected: session?.status === "connected", status: session?.status || "disconnected", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null });
 });
 
+app.get("/session/debug/:tenantId", auth, (req, res) => {
+  try {
+    const tenantId = req.params.tenantId;
+    if (!isValidTenantId(tenantId)) return res.status(400).json({ error: "Invalid tenantId" });
+    const sessDir = path.resolve(SESSIONS_DIR);
+    const tenantDir = path.resolve(sessionPath(tenantId));
+    const session = sessions.get(tenantId);
+    let files = [];
+    if (fs.existsSync(tenantDir)) {
+      try {
+        files = fs.readdirSync(tenantDir).map((f) => {
+          const fp = path.join(tenantDir, f);
+          let size = null;
+          try { size = fs.statSync(fp).size; } catch (_) {}
+          return { name: f, size };
+        });
+      } catch (_) {}
+    }
+    return res.json({
+      sessions_dir: sessDir,
+      tenant_dir: tenantDir,
+      tenant_dir_exists: fs.existsSync(tenantDir),
+      files,
+      session_status: session?.status || "not_in_memory",
+      session_phone: session?.phone || null,
+      sessions_dir_on_volume: sessDir.startsWith("/data"),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/session/disconnect", auth, async (req, res) => {
   try {
     const { tenant_id } = req.body;
@@ -576,12 +639,12 @@ app.post("/session/send", auth, async (req, res) => {
 
 async function restoreActiveSessions() {
   ensureSessionsDir();
-  const dirs = fs.readdirSync("./sessions").filter((d) => {
+  const dirs = fs.readdirSync(SESSIONS_DIR).filter((d) => {
     if (!isValidTenantId(d)) {
-      console.warn(`Skipping non-tenant directory: sessions/${d}`);
+      console.warn(`Skipping non-tenant directory: ${SESSIONS_DIR}/${d}`);
       return false;
     }
-    try { return fs.statSync(`./sessions/${d}`).isDirectory(); } catch (_) { return false; }
+    try { return fs.statSync(path.join(SESSIONS_DIR, d)).isDirectory(); } catch (_) { return false; }
   });
   if (dirs.length === 0) { console.log("No sessions to restore"); return; }
   for (const tenantId of dirs) {
@@ -610,5 +673,6 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
   console.log(`WA Bridge listening on port ${PORT}`);
+  console.log(`[bridge] Sessions directory: ${path.resolve(SESSIONS_DIR)}`);
   await restoreActiveSessions();
 });
