@@ -96,6 +96,16 @@ function buildBridgeMediaUrl(tenantId, messageId, mimetype, buffer) {
     return null;
   }
 }
+const MAX_RECONNECT_ATTEMPTS = 5;
+
+function isValidTenantId(name) {
+  if (!name || typeof name !== "string") return false;
+  if (name.startsWith(".")) return false;
+  if (name === "lost-found" || name === "lost+found") return false;
+  if (name.length < 2 || name.length > 128) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
 function sessionPath(tenantId) {
   return `./sessions/${tenantId}`;
 }
@@ -242,7 +252,7 @@ async function destroySession(tenantId, { removeFiles = false } = {}) {
   if (removeFiles) removeSessionFiles(tenantId);
 }
 
-async function startSession(tenantId, { forceFresh = false } = {}) {
+async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 0 } = {}) {
   const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = await getBaileys();
   const existing = sessions.get(tenantId);
   if (!forceFresh && existing) {
@@ -253,7 +263,7 @@ async function startSession(tenantId, { forceFresh = false } = {}) {
   if (forceFresh) await destroySession(tenantId, { removeFiles: true });
   ensureSessionsDir();
   
-  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map() };
+  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts };
   sessions.set(tenantId, sessionData);
   
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
@@ -312,15 +322,25 @@ async function startSession(tenantId, { forceFresh = false } = {}) {
         console.log(`[${tenantId}] Logged out`);
         return;
       }
-      
-      console.log(`[${tenantId}] Reconnecting in 5s...`);
+
+      current.reconnectAttempts = (current.reconnectAttempts || 0) + 1;
+      if (current.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        console.error(`[${tenantId}] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached — destroying damaged session`);
+        await destroySession(tenantId, { removeFiles: true });
+        await sendWebhook("disconnected", { tenant_id: tenantId, reconnecting: false, reason: "max_reconnect_attempts" });
+        return;
+      }
+
+      const delay = Math.min(5000 * current.reconnectAttempts, 30000);
+      console.log(`[${tenantId}] Reconnecting in ${delay}ms (attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
       setTimeout(async () => {
         const latest = sessions.get(tenantId);
         if (!latest || latest.sock !== sock) return;
+        const attempts = latest.reconnectAttempts;
         sessions.delete(tenantId);
-        try { await startSession(tenantId, { forceFresh: false }); }
+        try { await startSession(tenantId, { forceFresh: false, reconnectAttempts: attempts }); }
         catch (err) { console.error(`[${tenantId}] Reconnect failed:`, err.message); }
-      }, 5000);
+      }, delay);
     }
   });
 
@@ -557,6 +577,10 @@ app.post("/session/send", auth, async (req, res) => {
 async function restoreActiveSessions() {
   ensureSessionsDir();
   const dirs = fs.readdirSync("./sessions").filter((d) => {
+    if (!isValidTenantId(d)) {
+      console.warn(`Skipping non-tenant directory: sessions/${d}`);
+      return false;
+    }
     try { return fs.statSync(`./sessions/${d}`).isDirectory(); } catch (_) { return false; }
   });
   if (dirs.length === 0) { console.log("No sessions to restore"); return; }
@@ -565,6 +589,23 @@ async function restoreActiveSessions() {
     startSession(tenantId, { forceFresh: false }).catch((err) => console.error(`Failed to restore ${tenantId}:`, err.message));
   }
 }
+
+async function gracefulShutdown(signal) {
+  console.log(`[bridge] ${signal} received — shutting down gracefully`);
+  const tenantIds = [...sessions.keys()];
+  for (const tenantId of tenantIds) {
+    try {
+      await destroySession(tenantId, { removeFiles: false });
+      console.log(`[bridge] Session ${tenantId} closed`);
+    } catch (err) {
+      console.error(`[bridge] Error closing session ${tenantId}:`, err.message);
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
