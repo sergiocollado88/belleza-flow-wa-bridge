@@ -275,9 +275,9 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
   if (forceFresh) await destroySession(tenantId, { removeFiles: true });
   ensureSessionsDir();
   
-  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts };
+  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts, msgCache: new Map() };
   sessions.set(tenantId, sessionData);
-  
+
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
   const version = await getWAVersion();
 
@@ -288,8 +288,13 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
     printQRInTerminal: false,
     browser: ["Chrome (Linux)", "Chrome", "120.0.0"],
     syncFullHistory: false,
-    markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
+    getMessage: async (key) => {
+      const sess = sessions.get(tenantId);
+      const cached = sess?.msgCache?.get(key.id);
+      if (cached) return cached;
+      return { conversation: "" };
+    },
   });
   sessionData.sock = sock;
   
@@ -376,6 +381,16 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    const sess = sessions.get(tenantId);
+    for (const msg of messages) {
+      if (sess?.msgCache && msg?.key?.id && msg?.message) {
+        sess.msgCache.set(msg.key.id, msg.message);
+        if (sess.msgCache.size > 1000) {
+          const firstKey = sess.msgCache.keys().next().value;
+          sess.msgCache.delete(firstKey);
+        }
+      }
+    }
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg?.key?.fromMe) continue;
@@ -630,6 +645,13 @@ app.post("/session/send", auth, async (req, res) => {
 
     console.log(`[${tenant_id}] Sending out to mathematically cleaned jid=${jid}`);
     const result = await session.sock.sendMessage(jid, { text: String(message) });
+    if (result?.key?.id && session.msgCache) {
+      session.msgCache.set(result.key.id, { conversation: String(message) });
+      if (session.msgCache.size > 1000) {
+        const firstKey = session.msgCache.keys().next().value;
+        session.msgCache.delete(firstKey);
+      }
+    }
     return res.json({ success: true, jid, message_id: result?.key?.id || null });
   } catch (err) {
     console.error(`[${req.body?.tenant_id || "unknown"}] Send error:`, err.message);
