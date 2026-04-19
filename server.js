@@ -1,4 +1,4 @@
-// v4 - Added Multimedia Support (Base64 Extraction for Lovable)
+// v5 - Send queue fix, timing logs, /version endpoint
 const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
@@ -394,7 +394,10 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
     if (type !== "notify") return;
     for (const msg of messages) {
       if (msg?.key?.fromMe) continue;
+      const t0 = Date.now();
+      console.log(`[${tenantId}] [timing] inbound received id=${msg?.key?.id} jid=${msg?.key?.remoteJid}`);
       await handleIncoming(tenantId, msg);
+      console.log(`[${tenantId}] [timing] inbound processed in ${Date.now() - t0}ms`);
     }
   });
 
@@ -510,6 +513,13 @@ async function handleIncoming(tenantId, msg) {
 }
 
 app.get("/health", (_req, res) => { res.json({ ok: true, sessions: sessions.size }); });
+app.get("/version", (_req, res) => {
+  res.json({
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || "unknown",
+    branch: process.env.RAILWAY_GIT_BRANCH || "unknown",
+    deployed_at: process.env.RAILWAY_DEPLOYMENT_ID || "unknown",
+  });
+});
 app.get("/media/:tenantId/:fileName", (req, res) => {
   try {
     const tenantId = String(req.params.tenantId || "").trim();
@@ -643,12 +653,24 @@ app.post("/session/send", auth, async (req, res) => {
 
     if (!jid) return res.status(400).json({ error: "phone or recipient_jid required" });
 
-    console.log(`[${tenant_id}] Queuing send to jid=${jid}`);
+    const t0 = Date.now();
+    console.log(`[${tenant_id}] [timing] send start jid=${jid}`);
 
-    // Serialize sends per JID with a 600ms cooldown to avoid burst retries
+    // Serialize sends per JID: gate blocks the NEXT message, not this response.
+    // Flow: wait for prev → send → return response → wait 600ms → release gate
     const prev = (session.sendQueues.get(jid) || Promise.resolve()).catch(() => {});
-    const task = prev.then(async () => {
+
+    let gateResolve;
+    const gate = new Promise((r) => { gateResolve = r; });
+    // Next queued send for this JID will wait until gate resolves (after 600ms cooldown)
+    session.sendQueues.set(jid, gate.catch(() => {}));
+
+    const result = await prev.then(async () => {
+      const tSend = Date.now();
+      console.log(`[${tenant_id}] [timing] sock.sendMessage start jid=${jid} queue_wait=${tSend - t0}ms`);
       const r = await session.sock.sendMessage(jid, { text: String(message) });
+      const tDone = Date.now();
+      console.log(`[${tenant_id}] [timing] sock.sendMessage done id=${r?.key?.id} send_ms=${tDone - tSend}ms`);
       if (r?.key?.id && session.msgCache) {
         session.msgCache.set(r.key.id, { conversation: String(message) });
         if (session.msgCache.size > 1000) {
@@ -656,12 +678,12 @@ app.post("/session/send", auth, async (req, res) => {
           session.msgCache.delete(firstKey);
         }
       }
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Release gate after cooldown — gates next message, doesn't block this response
+      setTimeout(() => gateResolve(), 600);
       return r;
     });
-    session.sendQueues.set(jid, task.catch(() => {}));
 
-    const result = await task;
+    console.log(`[${tenant_id}] [timing] send total=${Date.now() - t0}ms id=${result?.key?.id}`);
     return res.json({ success: true, jid, message_id: result?.key?.id || null });
   } catch (err) {
     console.error(`[${req.body?.tenant_id || "unknown"}] Send error:`, err.message);
