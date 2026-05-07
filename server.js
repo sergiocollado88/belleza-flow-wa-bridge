@@ -1,4 +1,5 @@
-// v5 - Send queue fix, timing logs, /version endpoint
+// v6 - Multi-session per branch (feature/safe-multi-session-per-branch)
+// COMPAT: buildSessionKey(tenantId, null/undefined/'') === tenantId (session principal intacta)
 const express = require("express");
 const cors = require("cors");
 const QRCode = require("qrcode");
@@ -118,14 +119,55 @@ function isValidTenantId(name) {
   return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-function sessionPath(tenantId) {
-  return path.join(SESSIONS_DIR, String(tenantId));
+// Valida session keys que pueden contener __branch__ (el doble __ pasa porque _ está permitido)
+function isValidSessionKey(name) {
+  if (!name || typeof name !== "string") return false;
+  if (name.startsWith(".")) return false;
+  if (name === "lost-found" || name === "lost+found") return false;
+  if (name.length < 2 || name.length > 256) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-function removeSessionFiles(tenantId) {
-  const path = sessionPath(tenantId);
-  if (fs.existsSync(path)) {
-    fs.rmSync(path, { recursive: true, force: true });
+// ─── HELPERS MULTI-BRANCH ──────────────────────────────────────────────────
+// Normaliza branch_id: null/undefined/"" → null
+function normalizeBranchId(branchId) {
+  if (!branchId || typeof branchId !== "string") return null;
+  const trimmed = branchId.trim();
+  return trimmed || null;
+}
+
+// REGLA CRÍTICA DE COMPATIBILIDAD:
+//   buildSessionKey(tenantId, null)        → tenantId  (sesión principal: SIN cambio)
+//   buildSessionKey(tenantId, undefined)   → tenantId
+//   buildSessionKey(tenantId, "")          → tenantId
+//   buildSessionKey(tenantId, branchUuid)  → `${tenantId}__branch__${branchUuid}`
+function buildSessionKey(tenantId, branchId) {
+  const branch = normalizeBranchId(branchId);
+  if (!branch) return tenantId;
+  return `${tenantId}__branch__${branch}`;
+}
+
+// Ruta en disco para una sessionKey
+function getSessionPath(sessionKey) {
+  return path.join(SESSIONS_DIR, String(sessionKey));
+}
+
+// Contexto legible para logs
+function buildLogContext(tenantId, branchId) {
+  const branch = normalizeBranchId(branchId);
+  const sessionKey = buildSessionKey(tenantId, branchId);
+  return `[tenant=${tenantId} branch=${branch || "main"} session=${sessionKey}]`;
+}
+// ──────────────────────────────────────────────────────────────────────────
+
+function sessionPath(sessionKey) {
+  return getSessionPath(sessionKey);
+}
+
+function removeSessionFiles(sessionKey) {
+  const p = getSessionPath(sessionKey);
+  if (fs.existsSync(p)) {
+    fs.rmSync(p, { recursive: true, force: true });
   }
 }
 
@@ -254,31 +296,38 @@ async function sendWebhook(event, payload = {}) {
   }
 }
 
-async function destroySession(tenantId, { removeFiles = false } = {}) {
-  const existing = sessions.get(tenantId);
+async function destroySession(sessionKey, { removeFiles = false } = {}) {
+  const existing = sessions.get(sessionKey);
   if (existing?.sock) {
     try { await existing.sock.logout(); } catch (_) {}
     try { existing.sock.ws?.close?.(); } catch (_) {}
   }
-  sessions.delete(tenantId);
-  if (removeFiles) removeSessionFiles(tenantId);
+  sessions.delete(sessionKey);
+  if (removeFiles) removeSessionFiles(sessionKey);
 }
 
-async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 0 } = {}) {
+async function startSession(tenantId, branchId = null, { forceFresh = false, reconnectAttempts = 0 } = {}) {
+  const sessionKey = buildSessionKey(tenantId, branchId);
+  const logCtx = buildLogContext(tenantId, branchId);
   const { makeWASocket, useMultiFileAuthState, DisconnectReason } = await getBaileys();
-  const existing = sessions.get(tenantId);
+  const existing = sessions.get(sessionKey);
   if (!forceFresh && existing) {
     if (existing.status === "connected") return existing;
     if (existing.status === "qr_pending") return existing;
     if (existing.status === "starting") return existing;
   }
-  if (forceFresh) await destroySession(tenantId, { removeFiles: true });
+  if (forceFresh) await destroySession(sessionKey, { removeFiles: true });
   ensureSessionsDir();
-  
-  const sessionData = { sock: null, status: "starting", qrCode: null, phone: null, jid: null, startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts, msgCache: new Map(), sendQueues: new Map() };
-  sessions.set(tenantId, sessionData);
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath(tenantId));
+  const sessionData = {
+    sock: null, status: "starting", qrCode: null, phone: null, jid: null,
+    startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts,
+    msgCache: new Map(), sendQueues: new Map(),
+    tenantId, branchId: normalizeBranchId(branchId), sessionKey,
+  };
+  sessions.set(sessionKey, sessionData);
+
+  const { state, saveCreds } = await useMultiFileAuthState(getSessionPath(sessionKey));
   const version = await getWAVersion();
 
   const sock = makeWASocket({
@@ -290,40 +339,42 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
     getMessage: async (key) => {
-      const sess = sessions.get(tenantId);
+      const sess = sessions.get(sessionKey);
       const cached = sess?.msgCache?.get(key.id);
       if (cached) return cached;
       return { conversation: "" };
     },
   });
   sessionData.sock = sock;
-  
+
   sock.ev.on("creds.update", saveCreds);
-  
+
   const _syncContacts = (contacts) => {
-    const sess = sessions.get(tenantId);
+    const sess = sessions.get(sessionKey);
     if (!sess) return;
     sess.lidToPhone = sess.lidToPhone || new Map();
     for (const c of contacts || []) {
       if (c.id && c.lid) sess.lidToPhone.set(c.lid, c.id);
     }
   };
-  
+
   sock.ev.on("contacts-set", ({ contacts }) => _syncContacts(contacts));
   sock.ev.on("contacts-upsert", (contacts) => _syncContacts(contacts));
-  
+
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    const current = sessions.get(tenantId);
+    const current = sessions.get(sessionKey);
     if (!current || current.sock !== sock) return;
-    
+
     if (qr) {
       const qrImage = await QRCode.toDataURL(qr);
       current.status = "qr_pending";
       current.qrCode = qrImage;
-      await sendWebhook("qr_update", { tenant_id: tenantId, qr: qrImage });
-      console.log(`[${tenantId}] QR updated`);
+      const webhookPayload = { tenant_id: tenantId, qr: qrImage };
+      if (current.branchId) webhookPayload.branch_id = current.branchId;
+      await sendWebhook("qr_update", webhookPayload);
+      console.log(`${logCtx} QR updated`);
     }
-    
+
     if (connection === "open") {
       const rawSelfId = String(sock.user?.id || "").split(":")[0];
       const phone = normalizePhone(rawSelfId);
@@ -332,20 +383,24 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
       current.qrCode = null;
       current.phone = phone;
       current.jid = jid;
-      await sendWebhook("connected", { tenant_id: tenantId, phone_number: phone, jid });
-      console.log(`[${tenantId}] Connected - phone: ${phone || "unknown"}`);
+      const webhookPayload = { tenant_id: tenantId, phone_number: phone, jid };
+      if (current.branchId) webhookPayload.branch_id = current.branchId;
+      await sendWebhook("connected", webhookPayload);
+      console.log(`${logCtx} Connected - phone: ${phone || "unknown"}`);
     }
-    
+
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       current.status = loggedOut ? "disconnected" : "reconnecting";
       current.qrCode = null;
-      await sendWebhook("disconnected", { tenant_id: tenantId, reconnecting: !loggedOut });
-      
+      const dcPayload = { tenant_id: tenantId, reconnecting: !loggedOut };
+      if (current.branchId) dcPayload.branch_id = current.branchId;
+      await sendWebhook("disconnected", dcPayload);
+
       if (loggedOut) {
-        await destroySession(tenantId, { removeFiles: true });
-        console.log(`[${tenantId}] Logged out`);
+        await destroySession(sessionKey, { removeFiles: true });
+        console.log(`${logCtx} Logged out`);
         return;
       }
 
@@ -353,35 +408,39 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
       const isReplaced   = code === DisconnectReason.connectionReplaced;
       if (isBadSession || isReplaced) {
         const reason = isBadSession ? "bad_session" : "connection_replaced";
-        console.error(`[${tenantId}] Fatal disconnect (${code} – ${reason}) — removing session files`);
-        await destroySession(tenantId, { removeFiles: true });
-        await sendWebhook("disconnected", { tenant_id: tenantId, reconnecting: false, reason });
+        console.error(`${logCtx} Fatal disconnect (${code} – ${reason}) — removing session files`);
+        await destroySession(sessionKey, { removeFiles: true });
+        const fPayload = { tenant_id: tenantId, reconnecting: false, reason };
+        if (current.branchId) fPayload.branch_id = current.branchId;
+        await sendWebhook("disconnected", fPayload);
         return;
       }
 
       current.reconnectAttempts = (current.reconnectAttempts || 0) + 1;
       if (current.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        console.error(`[${tenantId}] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached — destroying damaged session`);
-        await destroySession(tenantId, { removeFiles: true });
-        await sendWebhook("disconnected", { tenant_id: tenantId, reconnecting: false, reason: "max_reconnect_attempts" });
+        console.error(`${logCtx} Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached — destroying damaged session`);
+        await destroySession(sessionKey, { removeFiles: true });
+        const mPayload = { tenant_id: tenantId, reconnecting: false, reason: "max_reconnect_attempts" };
+        if (current.branchId) mPayload.branch_id = current.branchId;
+        await sendWebhook("disconnected", mPayload);
         return;
       }
 
       const delay = Math.min(5000 * current.reconnectAttempts, 30000);
-      console.log(`[${tenantId}] Reconnecting in ${delay}ms (attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+      console.log(`${logCtx} Reconnecting in ${delay}ms (attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
       setTimeout(async () => {
-        const latest = sessions.get(tenantId);
+        const latest = sessions.get(sessionKey);
         if (!latest || latest.sock !== sock) return;
         const attempts = latest.reconnectAttempts;
-        sessions.delete(tenantId);
-        try { await startSession(tenantId, { forceFresh: false, reconnectAttempts: attempts }); }
-        catch (err) { console.error(`[${tenantId}] Reconnect failed:`, err.message); }
+        sessions.delete(sessionKey);
+        try { await startSession(tenantId, branchId, { forceFresh: false, reconnectAttempts: attempts }); }
+        catch (err) { console.error(`${logCtx} Reconnect failed:`, err.message); }
       }, delay);
     }
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    const sess = sessions.get(tenantId);
+    const sess = sessions.get(sessionKey);
     for (const msg of messages) {
       if (sess?.msgCache && msg?.key?.id && msg?.message) {
         sess.msgCache.set(msg.key.id, msg.message);
@@ -395,25 +454,25 @@ async function startSession(tenantId, { forceFresh = false, reconnectAttempts = 
     for (const msg of messages) {
       if (msg?.key?.fromMe) continue;
       const t0 = Date.now();
-      console.log(`[${tenantId}] [timing] inbound received id=${msg?.key?.id} jid=${msg?.key?.remoteJid}`);
-      await handleIncoming(tenantId, msg);
-      console.log(`[${tenantId}] [timing] inbound processed in ${Date.now() - t0}ms`);
+      console.log(`${logCtx} [timing] inbound received id=${msg?.key?.id} jid=${msg?.key?.remoteJid}`);
+      await handleIncoming(tenantId, branchId, msg);
+      console.log(`${logCtx} [timing] inbound processed in ${Date.now() - t0}ms`);
     }
   });
 
   return sessionData;
 }
 
-async function handleIncoming(tenantId, msg) {
+async function handleIncoming(tenantId, branchId, msg) {
+  const sessionKey = buildSessionKey(tenantId, branchId);
+  const logCtx = buildLogContext(tenantId, branchId);
+  const normalizedBranch = normalizeBranchId(branchId);
   try {
     const remoteJid = normalizeJid(msg?.key?.remoteJid);
     const participantJid = normalizeJid(msg?.key?.participant);
 
-    if (
-      isIgnoredIncomingJid(remoteJid) ||
-      isIgnoredIncomingJid(participantJid)
-    ) {
-      console.log(`[${tenantId}] Ignored status/broadcast/newsletter message`);
+    if (isIgnoredIncomingJid(remoteJid) || isIgnoredIncomingJid(participantJid)) {
+      console.log(`${logCtx} Ignored status/broadcast/newsletter message`);
       return;
     }
 
@@ -425,13 +484,13 @@ async function handleIncoming(tenantId, msg) {
 
     if (!conversationJid) return;
 
-    const phone = extractRealPhone(msg, tenantId);
+    const phone = extractRealPhone(msg, sessionKey);
     const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
     const senderName = String(msg?.pushName || "").trim() || phone || conversationJid;
 
-    // --- NUEVO COMPONENTE: EXTRACCIÓN DE FOTOS Y AUDIO (BASE64) ---
+    // --- EXTRACCIÓN DE FOTOS Y AUDIO (BASE64) ---
     let mediaBase64 = null;
     let mimetype = null;
     let messageType = "conversation";
@@ -451,37 +510,30 @@ async function handleIncoming(tenantId, msg) {
       mimetype = msg.message.documentMessage.mimetype;
     }
 
-    if (mimetype && sessions.has(tenantId)) {
+    if (mimetype && sessions.has(sessionKey)) {
       try {
         const { downloadMediaMessage } = await getBaileys();
-        const sock = sessions.get(tenantId).sock;
+        const sock = sessions.get(sessionKey).sock;
         const logger = P({ level: "silent" });
-        
-        // Descargamos la foto/voz desencriptada desde WhatsApp
         const buffer = await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
+          msg, "buffer", {},
           { logger, reuploadRequest: sock.updateMediaMessage }
         );
-        
-        // Convertir a base64 para enviarlo limpio a tu CRM
         if (buffer) {
           mediaBase64 = buffer.toString("base64");
           bridgeMediaUrl = buildBridgeMediaUrl(
             tenantId,
             msg?.key?.id || `media_${Date.now()}`,
-            mimetype,
-            buffer
+            mimetype, buffer
           );
         }
       } catch (err) {
-        console.error(`[${tenantId}] Error extrayendo multimedia:`, err.message);
+        console.error(`${logCtx} Error extrayendo multimedia:`, err.message);
       }
     }
-    // --------------------------------------------------------------
+    // -------------------------------------------
 
-    await sendWebhook("message", {
+    const webhookPayload = {
       tenant_id: tenantId,
       from: phone,
       phone,
@@ -497,18 +549,15 @@ async function handleIncoming(tenantId, msg) {
       download_url: bridgeMediaUrl,
       media_url: bridgeMediaUrl,
       mimetype: mimetype || null,
-      message: {
-        base64: mediaBase64,
-        mimetype: mimetype || null,
-        messageType: messageType
-      }
-    });
+      message: { base64: mediaBase64, mimetype: mimetype || null, messageType },
+    };
+    if (normalizedBranch) webhookPayload.branch_id = normalizedBranch;
 
-    console.log(
-      `[${tenantId}] Incoming from ${senderName} (${phone || "sin-phone"}) jid=${conversationJid}: ${String(body).slice(0, 60)}`
-    );
+    await sendWebhook("message", webhookPayload);
+
+    console.log(`${logCtx} Incoming from ${senderName} (${phone || "sin-phone"}) jid=${conversationJid}: ${String(body).slice(0, 60)}`);
   } catch (err) {
-    console.error(`[${tenantId}] handleIncoming error:`, err.message);
+    console.error(`${logCtx} handleIncoming error:`, err.message);
   }
 }
 
@@ -569,12 +618,13 @@ app.get("/media/:tenantId/:fileName", (req, res) => {
 
 app.post("/session/start", auth, async (req, res) => {
   try {
-    const { tenant_id } = req.body;
+    const { tenant_id, branch_id } = req.body;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
-    const existing = sessions.get(tenant_id);
+    const sessionKey = buildSessionKey(tenant_id, branch_id);
+    const existing = sessions.get(sessionKey);
     const forceFresh = !existing || existing.status !== "connected";
-    const session = await startSession(tenant_id, { forceFresh });
-    return res.json({ success: true, status: session?.status || "starting", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null });
+    const session = await startSession(tenant_id, branch_id || null, { forceFresh });
+    return res.json({ success: true, status: session?.status || "starting", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null, session_key: session?.sessionKey || sessionKey });
   } catch (err) {
     console.error("/session/start error:", err.message);
     return res.status(500).json({ error: err.message });
@@ -582,22 +632,26 @@ app.post("/session/start", auth, async (req, res) => {
 });
 
 app.get("/session/status/:tenantId", auth, (req, res) => {
-  const session = sessions.get(req.params.tenantId);
-  return res.json({ connected: session?.status === "connected", status: session?.status || "disconnected", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null });
+  const branch_id = req.query.branch_id || null;
+  const sessionKey = buildSessionKey(req.params.tenantId, branch_id);
+  const session = sessions.get(sessionKey);
+  return res.json({ connected: session?.status === "connected", status: session?.status || "disconnected", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null, session_key: sessionKey });
 });
 
 app.get("/session/debug/:tenantId", auth, (req, res) => {
   try {
     const tenantId = req.params.tenantId;
+    const branch_id = req.query.branch_id || null;
     if (!isValidTenantId(tenantId)) return res.status(400).json({ error: "Invalid tenantId" });
+    const sessionKey = buildSessionKey(tenantId, branch_id);
     const sessDir = path.resolve(SESSIONS_DIR);
-    const tenantDir = path.resolve(sessionPath(tenantId));
-    const session = sessions.get(tenantId);
+    const sessKeyDir = path.resolve(getSessionPath(sessionKey));
+    const session = sessions.get(sessionKey);
     let files = [];
-    if (fs.existsSync(tenantDir)) {
+    if (fs.existsSync(sessKeyDir)) {
       try {
-        files = fs.readdirSync(tenantDir).map((f) => {
-          const fp = path.join(tenantDir, f);
+        files = fs.readdirSync(sessKeyDir).map((f) => {
+          const fp = path.join(sessKeyDir, f);
           let size = null;
           try { size = fs.statSync(fp).size; } catch (_) {}
           return { name: f, size };
@@ -606,8 +660,9 @@ app.get("/session/debug/:tenantId", auth, (req, res) => {
     }
     return res.json({
       sessions_dir: sessDir,
-      tenant_dir: tenantDir,
-      tenant_dir_exists: fs.existsSync(tenantDir),
+      session_key: sessionKey,
+      tenant_dir: sessKeyDir,
+      tenant_dir_exists: fs.existsSync(sessKeyDir),
       files,
       session_status: session?.status || "not_in_memory",
       session_phone: session?.phone || null,
@@ -620,11 +675,15 @@ app.get("/session/debug/:tenantId", auth, (req, res) => {
 
 app.post("/session/disconnect", auth, async (req, res) => {
   try {
-    const { tenant_id } = req.body;
+    const { tenant_id, branch_id } = req.body;
     if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
-    await destroySession(tenant_id, { removeFiles: true });
-    await sendWebhook("disconnected", { tenant_id, reconnecting: false });
-    return res.json({ success: true });
+    const sessionKey = buildSessionKey(tenant_id, branch_id);
+    const normalizedBranch = normalizeBranchId(branch_id);
+    await destroySession(sessionKey, { removeFiles: true });
+    const webhookPayload = { tenant_id, reconnecting: false };
+    if (normalizedBranch) webhookPayload.branch_id = normalizedBranch;
+    await sendWebhook("disconnected", webhookPayload);
+    return res.json({ success: true, session_key: sessionKey });
   } catch (err) {
     console.error("/session/disconnect error:", err.message);
     return res.status(500).json({ error: err.message });
@@ -633,44 +692,38 @@ app.post("/session/disconnect", auth, async (req, res) => {
 
 app.post("/session/send", auth, async (req, res) => {
   try {
-    const { tenant_id, phone, recipient_jid, message } = req.body;
+    const { tenant_id, branch_id, phone, recipient_jid, message } = req.body;
     if (!tenant_id || !message) return res.status(400).json({ error: "tenant_id and message required" });
-    
-    const session = sessions.get(tenant_id);
+    const sessionKey = buildSessionKey(tenant_id, branch_id);
+    const logCtx = buildLogContext(tenant_id, branch_id);
+
+    const session = sessions.get(sessionKey);
     if (!session?.sock || session.status !== "connected") {
       return res.status(404).json({ error: "Session not found or not connected" });
     }
 
     let jid = null;
     const target = recipient_jid || phone;
-
     if (target) {
       const justNumbers = String(target).replace(/\D/g, "");
-      if (justNumbers) {
-        jid = `${justNumbers}@s.whatsapp.net`;
-      }
+      if (justNumbers) jid = `${justNumbers}@s.whatsapp.net`;
     }
-
     if (!jid) return res.status(400).json({ error: "phone or recipient_jid required" });
 
     const t0 = Date.now();
-    console.log(`[${tenant_id}] [timing] send start jid=${jid}`);
+    console.log(`${logCtx} [timing] send start jid=${jid}`);
 
-    // Serialize sends per JID: gate blocks the NEXT message, not this response.
-    // Flow: wait for prev → send → return response → wait 600ms → release gate
     const prev = (session.sendQueues.get(jid) || Promise.resolve()).catch(() => {});
-
     let gateResolve;
     const gate = new Promise((r) => { gateResolve = r; });
-    // Next queued send for this JID will wait until gate resolves (after 600ms cooldown)
     session.sendQueues.set(jid, gate.catch(() => {}));
 
     const result = await prev.then(async () => {
       const tSend = Date.now();
-      console.log(`[${tenant_id}] [timing] sock.sendMessage start jid=${jid} queue_wait=${tSend - t0}ms`);
+      console.log(`${logCtx} [timing] sock.sendMessage start jid=${jid} queue_wait=${tSend - t0}ms`);
       const r = await session.sock.sendMessage(jid, { text: String(message) });
       const tDone = Date.now();
-      console.log(`[${tenant_id}] [timing] sock.sendMessage done id=${r?.key?.id} send_ms=${tDone - tSend}ms`);
+      console.log(`${logCtx} [timing] sock.sendMessage done id=${r?.key?.id} send_ms=${tDone - tSend}ms`);
       if (r?.key?.id && session.msgCache) {
         session.msgCache.set(r.key.id, { conversation: String(message) });
         if (session.msgCache.size > 1000) {
@@ -678,15 +731,14 @@ app.post("/session/send", auth, async (req, res) => {
           session.msgCache.delete(firstKey);
         }
       }
-      // Release gate after cooldown — gates next message, doesn't block this response
       setTimeout(() => gateResolve(), 600);
       return r;
     });
 
-    console.log(`[${tenant_id}] [timing] send total=${Date.now() - t0}ms id=${result?.key?.id}`);
+    console.log(`${logCtx} [timing] send total=${Date.now() - t0}ms id=${result?.key?.id}`);
     return res.json({ success: true, jid, message_id: result?.key?.id || null });
   } catch (err) {
-    console.error(`[${req.body?.tenant_id || "unknown"}] Send error:`, err.message);
+    console.error(`${buildLogContext(req.body?.tenant_id || "unknown", req.body?.branch_id)} Send error:`, err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -694,16 +746,24 @@ app.post("/session/send", auth, async (req, res) => {
 async function restoreActiveSessions() {
   ensureSessionsDir();
   const dirs = fs.readdirSync(SESSIONS_DIR).filter((d) => {
-    if (!isValidTenantId(d)) {
-      console.warn(`Skipping non-tenant directory: ${SESSIONS_DIR}/${d}`);
+    if (d.startsWith(".")) return false;
+    if (d === "lost-found" || d === "lost+found") return false;
+    if (!isValidSessionKey(d)) {
+      console.warn(`Skipping invalid session directory: ${SESSIONS_DIR}/${d}`);
       return false;
     }
     try { return fs.statSync(path.join(SESSIONS_DIR, d)).isDirectory(); } catch (_) { return false; }
   });
   if (dirs.length === 0) { console.log("No sessions to restore"); return; }
-  for (const tenantId of dirs) {
-    console.log(`Restoring session: ${tenantId}`);
-    startSession(tenantId, { forceFresh: false }).catch((err) => console.error(`Failed to restore ${tenantId}:`, err.message));
+  for (const sessionKey of dirs) {
+    // Detectar si es sesión principal (tenant_id) o de sucursal (tenant__branch__branch_id)
+    const parts = sessionKey.split("__branch__");
+    const tenantId = parts[0];
+    const branchId = parts.length > 1 ? parts[1] : null;
+    const logCtx = buildLogContext(tenantId, branchId);
+    console.log(`Restoring session: ${logCtx}`);
+    startSession(tenantId, branchId, { forceFresh: false })
+      .catch((err) => console.error(`Failed to restore ${logCtx}:`, err.message));
   }
 }
 
