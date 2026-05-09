@@ -273,8 +273,18 @@ function auth(req, res, next) {
 
 async function sendWebhook(event, payload = {}) {
   if (!WA_WEBHOOK_URL) return;
+  const tenant_id = payload.tenant_id;
+  const branch_id = payload.branch_id ?? null;
+
+  console.log("[BRIDGE_SEND_WEBHOOK]", {
+    event,
+    tenant_id,
+    branch_id,
+    url: WA_WEBHOOK_URL ? "configured" : "missing",
+  });
+
   try {
-    const { tenant_id, ...data } = payload;
+    const { tenant_id: _, ...data } = payload;
     if (!tenant_id) {
       console.error(`Webhook ${event} skipped: missing tenant_id`);
       return;
@@ -287,9 +297,20 @@ async function sendWebhook(event, payload = {}) {
       },
       body: JSON.stringify({ event, tenant_id, data }),
     });
+
+    const responseBody = await response.text().catch(() => null);
+
+    console.log("[BRIDGE_WEBHOOK_RESPONSE]", {
+      event,
+      tenant_id,
+      branch_id,
+      status: response.status,
+      ok: response.ok,
+      body: responseBody,
+    });
+
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      console.error(`Webhook ${event} failed: ${response.status} ${text}`);
+      console.error(`Webhook ${event} failed: ${response.status} ${responseBody}`);
     }
   } catch (err) {
     console.error(`Webhook ${event} error:`, err.message);
@@ -383,6 +404,15 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
       current.qrCode = null;
       current.phone = phone;
       current.jid = jid;
+
+      console.log("[BRIDGE_CONNECTED_EVENT]", {
+        tenant_id: tenantId,
+        branch_id: current.branchId,
+        sessionKey: current.sessionKey,
+        phone,
+        jid
+      });
+
       const webhookPayload = { tenant_id: tenantId, phone_number: phone, jid };
       if (current.branchId) webhookPayload.branch_id = current.branchId;
       await sendWebhook("connected", webhookPayload);
