@@ -320,7 +320,11 @@ async function sendWebhook(event, payload = {}) {
 async function destroySession(sessionKey, { removeFiles = false } = {}) {
   const existing = sessions.get(sessionKey);
   if (existing?.sock) {
-    try { await existing.sock.logout(); } catch (_) {}
+    // CRITICAL: only logout if actually connected — calling logout on a pending
+    // QR session invalidates the QR code the user is currently scanning.
+    if (existing.status === "connected") {
+      try { await existing.sock.logout(); } catch (_) {}
+    }
     try { existing.sock.ws?.close?.(); } catch (_) {}
   }
   sessions.delete(sessionKey);
@@ -652,7 +656,12 @@ app.post("/session/start", auth, async (req, res) => {
     if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
     const sessionKey = buildSessionKey(tenant_id, branch_id);
     const existing = sessions.get(sessionKey);
-    const forceFresh = !existing || existing.status !== "connected";
+    // CRITICAL: do NOT force a fresh session if one is already showing a QR
+    // or still starting — doing so destroys the current QR and the user gets
+    // "QR code not valid" when they try to scan the old one.
+    const forceFresh = Boolean(
+      existing && ["disconnected", "reconnecting"].includes(existing.status)
+    );
     const session = await startSession(tenant_id, branch_id || null, { forceFresh });
     return res.json({ success: true, status: session?.status || "starting", qr_code: session?.qrCode || null, phone: session?.phone || null, jid: session?.jid || null, session_key: session?.sessionKey || sessionKey });
   } catch (err) {
