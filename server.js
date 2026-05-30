@@ -553,6 +553,7 @@ async function handleIncoming(tenantId, branchId, msg) {
         console.log(`${logCtx} [lid-debug] key=${JSON.stringify(msg?.key || {})} senderPn=${msg?.senderPn || null} participantPn=${msg?.participantPn || null}`);
       }
     }
+    const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
     const senderName = String(msg?.pushName || "").trim() || phone || conversationJid;
