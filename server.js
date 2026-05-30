@@ -519,21 +519,38 @@ async function handleIncoming(tenantId, branchId, msg) {
     if (!conversationJid) return;
 
     let phone = extractRealPhone(msg, sessionKey);
-    // Resolve LID → real phone via WhatsApp servers when the lidToPhone map is cold
-    if (!phone && conversationJid && conversationJid.endsWith('@lid')) {
-      try {
-        const _sess = sessions.get(sessionKey);
-        const results = _sess?.sock?.onWhatsApp ? await _sess.sock.onWhatsApp(conversationJid) : null;
-        if (results?.[0]?.jid) {
-          phone = normalizePhone(results[0].jid);
-          if (phone) {
-            if (!_sess.lidToPhone) _sess.lidToPhone = new Map();
-            _sess.lidToPhone.set(conversationJid, results[0].jid);
-            console.log(`${logCtx} LID resolved: ${conversationJid} → ${phone}`);
+    // Resolve LID → real phone. WhatsApp's privacy LID hides the phone; the real
+    // number lives either in the message PN alt fields or Baileys' LID↔PN store.
+    if (!phone) {
+      const _lidJid = [conversationJid, msg?.key?.remoteJid, msg?.key?.participant]
+        .find((j) => typeof j === "string" && j.endsWith("@lid"));
+      // 1) PN alt fields that some message types carry
+      const _altPn = msg?.key?.remoteJidAlt || msg?.key?.participantAlt ||
+        msg?.key?.senderPn || msg?.senderPn ||
+        msg?.key?.participantPn || msg?.participantPn || null;
+      if (_altPn) phone = normalizePhone(_altPn);
+      // 2) Baileys signal LID mapping (populated at decrypt time)
+      if (!phone && _lidJid) {
+        try {
+          const _sess = sessions.get(sessionKey);
+          const _map = _sess?.sock?.signalRepository?.lidMapping;
+          let _pn = null;
+          if (_map?.getPNForLID) _pn = await _map.getPNForLID(_lidJid);
+          if (_pn) {
+            phone = normalizePhone(_pn);
+            if (phone) {
+              if (!_sess.lidToPhone) _sess.lidToPhone = new Map();
+              _sess.lidToPhone.set(_lidJid, _pn);
+              console.log(`${logCtx} LID mapped: ${_lidJid} -> ${phone}`);
+            }
           }
+        } catch (_e) {
+          console.error(`${logCtx} LID map error:`, _e.message);
         }
-      } catch (_e) {
-        console.error(`${logCtx} LID resolve error:`, _e.message);
+      }
+      // 3) Diagnostic: dump raw key so we can see exactly which field holds the phone
+      if (!phone) {
+        console.log(`${logCtx} [lid-debug] key=${JSON.stringify(msg?.key || {})} senderPn=${msg?.senderPn || null} participantPn=${msg?.participantPn || null}`);
       }
     }
     const body = extractMessageBody(msg);
