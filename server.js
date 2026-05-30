@@ -518,7 +518,24 @@ async function handleIncoming(tenantId, branchId, msg) {
 
     if (!conversationJid) return;
 
-    const phone = extractRealPhone(msg, sessionKey);
+    let phone = extractRealPhone(msg, sessionKey);
+    // Resolve LID → real phone via WhatsApp servers when the lidToPhone map is cold
+    if (!phone && conversationJid && conversationJid.endsWith('@lid')) {
+      try {
+        const _sess = sessions.get(sessionKey);
+        const results = _sess?.sock?.onWhatsApp ? await _sess.sock.onWhatsApp(conversationJid) : null;
+        if (results?.[0]?.jid) {
+          phone = normalizePhone(results[0].jid);
+          if (phone) {
+            if (!_sess.lidToPhone) _sess.lidToPhone = new Map();
+            _sess.lidToPhone.set(conversationJid, results[0].jid);
+            console.log(`${logCtx} LID resolved: ${conversationJid} → ${phone}`);
+          }
+        }
+      } catch (_e) {
+        console.error(`${logCtx} LID resolve error:`, _e.message);
+      }
+    }
     const body = extractMessageBody(msg);
     const rawTimestamp = Number(msg?.messageTimestamp || Math.floor(Date.now() / 1000));
     const ts = new Date(rawTimestamp * 1000).toISOString();
