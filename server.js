@@ -408,6 +408,7 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
       current.qrCode = null;
       current.phone = phone;
       current.jid = jid;
+      current.reconnectAttempts = 0; // conexión sana: resetear contador de reintentos
 
       console.log("[BRIDGE_CONNECTED_EVENT]", {
         tenant_id: tenantId,
@@ -426,48 +427,51 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      current.status = loggedOut ? "disconnected" : "reconnecting";
       current.qrCode = null;
-      const dcPayload = { tenant_id: tenantId, reconnecting: !loggedOut };
-      if (current.branchId) dcPayload.branch_id = current.branchId;
-      await sendWebhook("disconnected", dcPayload);
 
+      // REGLA 1: solo loggedOut (401) borra credenciales y fuerza re-escaneo de QR.
+      // Es el único caso que emite "disconnected" y elimina la carpeta de sesión.
       if (loggedOut) {
+        current.status = "disconnected";
+        const dcPayload = { tenant_id: tenantId, reconnecting: false };
+        if (current.branchId) dcPayload.branch_id = current.branchId;
+        await sendWebhook("disconnected", dcPayload);
         await destroySession(sessionKey, { removeFiles: true });
-        console.log(`${logCtx} Logged out`);
+        console.log(`${logCtx} Logged out (401) — session files removed, QR required`);
         return;
       }
 
-      const isBadSession = code === DisconnectReason.badSession;
-      const isReplaced   = code === DisconnectReason.connectionReplaced;
-      if (isBadSession || isReplaced) {
-        const reason = isBadSession ? "bad_session" : "connection_replaced";
-        console.error(`${logCtx} Fatal disconnect (${code} – ${reason}) — removing session files`);
-        await destroySession(sessionKey, { removeFiles: true });
-        const fPayload = { tenant_id: tenantId, reconnecting: false, reason };
-        if (current.branchId) fPayload.branch_id = current.branchId;
-        await sendWebhook("disconnected", fPayload);
-        return;
-      }
+      // REGLA 2: cualquier otro motivo (408/428/440/500/503/515, stream errors, etc.)
+      // reconecta reutilizando las credenciales guardadas. NO se borra nada ni se
+      // emite "disconnected".
+      current.status = "reconnecting";
+
+      // REGLA 3: 515 (restartRequired) no es fatal → reconectar de inmediato reusando creds.
+      const isRestartRequired = code === DisconnectReason.restartRequired;
 
       current.reconnectAttempts = (current.reconnectAttempts || 0) + 1;
-      if (current.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        console.error(`${logCtx} Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached — destroying damaged session`);
-        await destroySession(sessionKey, { removeFiles: true });
-        const mPayload = { tenant_id: tenantId, reconnecting: false, reason: "max_reconnect_attempts" };
-        if (current.branchId) mPayload.branch_id = current.branchId;
-        await sendWebhook("disconnected", mPayload);
-        return;
+      const attempts = current.reconnectAttempts;
+
+      // REGLA 4: al agotar reintentos NO se borran credenciales ni se emite
+      // "disconnected": se sigue reintentando con backoff topado (30–60s) y
+      // estado "reconnecting".
+      let delay;
+      if (isRestartRequired) {
+        delay = 0;
+      } else if (attempts > MAX_RECONNECT_ATTEMPTS) {
+        delay = Math.min(30000 + 5000 * (attempts - MAX_RECONNECT_ATTEMPTS), 60000);
+        console.warn(`${logCtx} Reconnect attempts exhausted (${attempts}) — keeping saved creds, retrying in ${delay}ms`);
+      } else {
+        delay = Math.min(5000 * attempts, 30000);
       }
 
-      const delay = Math.min(5000 * current.reconnectAttempts, 30000);
-      console.log(`${logCtx} Reconnecting in ${delay}ms (attempt ${current.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+      console.log(`${logCtx} Connection closed (code=${code ?? "unknown"}) — reconnecting in ${delay}ms reusing saved creds (attempt ${attempts})`);
       setTimeout(async () => {
         const latest = sessions.get(sessionKey);
         if (!latest || latest.sock !== sock) return;
-        const attempts = latest.reconnectAttempts;
+        const nextAttempts = latest.reconnectAttempts;
         sessions.delete(sessionKey);
-        try { await startSession(tenantId, branchId, { forceFresh: false, reconnectAttempts: attempts }); }
+        try { await startSession(tenantId, branchId, { forceFresh: false, reconnectAttempts: nextAttempts }); }
         catch (err) { console.error(`${logCtx} Reconnect failed:`, err.message); }
       }, delay);
     }
