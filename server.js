@@ -6,6 +6,7 @@ const QRCode = require("qrcode");
 const P = require("pino");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const app = express();
 
 app.use(cors());
@@ -36,6 +37,16 @@ function warnMissingBridgeWebhookKey() {
   if (warnedMissingBridgeWebhookKey) return;
   console.warn("[bridge] BRIDGE_WEBHOOK_KEY env var is not configured; outgoing webhooks will not include x-bridge-api-key");
   warnedMissingBridgeWebhookKey = true;
+}
+
+function buildBridgeWebhookKeyDiagnostics() {
+  return {
+    bridgeWebhookKeyConfigured: Boolean(BRIDGE_WEBHOOK_KEY),
+    bridgeWebhookKeyLength: BRIDGE_WEBHOOK_KEY ? BRIDGE_WEBHOOK_KEY.length : null,
+    bridgeWebhookKeyHashPrefix: BRIDGE_WEBHOOK_KEY
+      ? crypto.createHash("sha256").update(BRIDGE_WEBHOOK_KEY).digest("hex").slice(0, 8)
+      : null,
+  };
 }
 
 let baileysCache = null;
@@ -295,6 +306,7 @@ async function sendWebhook(event, payload = {}) {
     tenant_id,
     branch_id,
     url: WA_WEBHOOK_URL ? "configured" : "missing",
+    ...buildBridgeWebhookKeyDiagnostics(),
   });
 
   try {

@@ -5,7 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadBridge({ env, fetchImpl, warnImpl = () => {} }) {
+function loadBridge({ env, fetchImpl, logImpl = () => {}, warnImpl = () => {} }) {
   const serverPath = path.join(__dirname, "..", "server.js");
   const source = `${fs.readFileSync(serverPath, "utf8")}\nglobalThis.__bridgeTestExports = { sendWebhook };`;
   const nativeRequire = createRequire(serverPath);
@@ -42,7 +42,7 @@ function loadBridge({ env, fetchImpl, warnImpl = () => {} }) {
     clearTimeout,
     console: {
       error() {},
-      log() {},
+      log: logImpl,
       warn: warnImpl,
     },
     exports: {},
@@ -69,12 +69,14 @@ function loadBridge({ env, fetchImpl, warnImpl = () => {} }) {
 
 test("sendWebhook authenticates outgoing webhook events with BRIDGE_WEBHOOK_KEY", async () => {
   let request;
+  const logs = [];
   const { sendWebhook } = loadBridge({
     env: {
       BRIDGE_API_KEY: "control-key",
       BRIDGE_WEBHOOK_KEY: "webhook-key",
       WA_WEBHOOK_URL: "https://example.test/webhook",
     },
+    logImpl: (...args) => logs.push(args),
     fetchImpl: async (url, options) => {
       request = { url, options };
       return new Response("ok", { status: 200 });
@@ -87,6 +89,13 @@ test("sendWebhook authenticates outgoing webhook events with BRIDGE_WEBHOOK_KEY"
   assert.equal(request.options.headers["x-bridge-api-key"], "webhook-key");
   assert.equal(request.options.headers["x-webhook-secret"], undefined);
   assert.notEqual(request.options.headers["x-bridge-api-key"], "control-key");
+
+  const sendLog = logs.find(([label]) => label === "[BRIDGE_SEND_WEBHOOK]");
+  assert.ok(sendLog);
+  assert.equal(sendLog[1].bridgeWebhookKeyConfigured, true);
+  assert.equal(sendLog[1].bridgeWebhookKeyLength, "webhook-key".length);
+  assert.equal(sendLog[1].bridgeWebhookKeyHashPrefix, "bb6a6ea1");
+  assert.doesNotMatch(JSON.stringify(sendLog[1]), /webhook-key|control-key/);
 });
 
 test("sendWebhook warns when BRIDGE_WEBHOOK_KEY is missing", async () => {
