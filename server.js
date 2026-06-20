@@ -14,6 +14,7 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 const WA_WEBHOOK_URL = process.env.WA_WEBHOOK_URL;
+const BRIDGE_WEBHOOK_KEY = process.env.BRIDGE_WEBHOOK_KEY;
 const BRIDGE_PUBLIC_URL =
   process.env.BRIDGE_PUBLIC_URL ||
   (process.env.RAILWAY_STATIC_URL ? `https://${process.env.RAILWAY_STATIC_URL}` : null) ||
@@ -22,9 +23,19 @@ const BRIDGE_PUBLIC_URL =
 const MEDIA_CACHE_ROOT = "./media-cache";
 const MEDIA_CACHE_TTL_MS = 72 * 60 * 60 * 1000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
+let warnedMissingBridgeWebhookKey = false;
 if (!BRIDGE_API_KEY) {
   console.error("BRIDGE_API_KEY env var is required");
   process.exit(1);
+}
+if (WA_WEBHOOK_URL && !BRIDGE_WEBHOOK_KEY) {
+  warnMissingBridgeWebhookKey();
+}
+
+function warnMissingBridgeWebhookKey() {
+  if (warnedMissingBridgeWebhookKey) return;
+  console.warn("[bridge] BRIDGE_WEBHOOK_KEY env var is not configured; outgoing webhooks will not include x-bridge-api-key");
+  warnedMissingBridgeWebhookKey = true;
 }
 
 let baileysCache = null;
@@ -273,6 +284,9 @@ function auth(req, res, next) {
 
 async function sendWebhook(event, payload = {}) {
   if (!WA_WEBHOOK_URL) return;
+  if (!BRIDGE_WEBHOOK_KEY) {
+    warnMissingBridgeWebhookKey();
+  }
   const tenant_id = payload.tenant_id;
   const branch_id = payload.branch_id ?? null;
 
@@ -289,12 +303,16 @@ async function sendWebhook(event, payload = {}) {
       console.error(`Webhook ${event} skipped: missing tenant_id`);
       return;
     }
+    const headers = {
+      "Content-Type": "application/json",
+    };
+    if (BRIDGE_WEBHOOK_KEY) {
+      headers["x-bridge-api-key"] = BRIDGE_WEBHOOK_KEY;
+    }
+
     const response = await fetch(WA_WEBHOOK_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-webhook-secret": BRIDGE_API_KEY,
-      },
+      headers,
       body: JSON.stringify({ event, tenant_id, data }),
     });
 
