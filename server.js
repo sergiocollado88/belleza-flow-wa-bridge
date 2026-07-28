@@ -133,6 +133,93 @@ function buildBridgeMediaUrl(tenantId, messageId, mimetype, buffer) {
 }
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+/**
+ * Códigos con los que WhatsApp NO cierra la conexión por un problema de red:
+ * cierra porque rechaza las credenciales que le acabamos de presentar.
+ *
+ *   403 forbidden          — el número está bloqueado o el enlace se revocó
+ *   405 connectionFailure  — el servidor rechaza el login; el dispositivo dejó
+ *                            de estar enlazado sin llegar a mandar un 401 limpio
+ *   500 badSession         — el fichero de sesión ya no es válido
+ *
+ * Reintentar con las MISMAS credenciales reproduce el mismo cierre, así que
+ * insistir no es tolerancia a fallos: es un bucle que no termina nunca. Y
+ * mientras dura, Baileys no emite ningún QR —solo lo emite cuando no hay
+ * credenciales que presentar—, con lo que el negocio se queda sin forma de
+ * volver a enlazar el teléfono.
+ */
+const CODIGOS_DE_CREDENCIAL_RECHAZADA = Object.freeze([403, 405, 500]);
+
+/**
+ * Cuántos cierres seguidos por credencial rechazada se toleran antes de darlas
+ * por muertas y volver a pedir QR.
+ *
+ * No es cero a propósito: un 405 aislado durante una incidencia de WhatsApp no
+ * debe costarle a todos los negocios volver a escanear. Tres seguidos, con el
+ * backoff de por medio, ya no es una incidencia pasajera.
+ */
+const MAX_INTENTOS_CON_CREDENCIAL_RECHAZADA = 3;
+
+/**
+ * Decide qué hacer con un cierre de conexión. Función pura: no toca sesiones,
+ * no borra ficheros y no habla por la red, para poder probar la decisión sin
+ * levantar un socket contra WhatsApp.
+ *
+ * Devuelve una de tres acciones:
+ *   · `cerrar_sesion`  — 401: la sesión terminó, se borran credenciales.
+ *   · `regenerar_qr`   — las credenciales están muertas: se borran y se arranca
+ *                        una sesión nueva, que es lo que produce un QR.
+ *   · `reconectar`     — cierre transitorio: se reintenta reusando credenciales.
+ */
+function decidirCierreDeConexion({
+  code,
+  reconnectAttempts = 0,
+  credencialRechazadaAttempts = 0,
+  loggedOutCode = 401,
+  restartRequiredCode = 515,
+}) {
+  if (code === loggedOutCode) {
+    return { accion: "cerrar_sesion", delay: 0, reconnectAttempts, credencialRechazadaAttempts: 0 };
+  }
+
+  const credencialRechazada = CODIGOS_DE_CREDENCIAL_RECHAZADA.includes(code);
+  const rechazos = credencialRechazada ? credencialRechazadaAttempts + 1 : 0;
+
+  if (credencialRechazada && rechazos >= MAX_INTENTOS_CON_CREDENCIAL_RECHAZADA) {
+    return {
+      accion: "regenerar_qr",
+      // Un respiro corto antes de rearrancar: lo suficiente para no encadenar
+      // dos arranques en el mismo tick, no tanto como para dejar al negocio
+      // mirando una pantalla vacía.
+      delay: 2000,
+      code,
+      rechazos,
+      reconnectAttempts: 0,
+      credencialRechazadaAttempts: 0,
+    };
+  }
+
+  const intentos = reconnectAttempts + 1;
+  let delay;
+  let agotado = false;
+  if (code === restartRequiredCode) {
+    delay = 0;
+  } else if (intentos > MAX_RECONNECT_ATTEMPTS) {
+    delay = Math.min(30000 + 5000 * (intentos - MAX_RECONNECT_ATTEMPTS), 60000);
+    agotado = true;
+  } else {
+    delay = Math.min(5000 * intentos, 30000);
+  }
+
+  return {
+    accion: "reconectar",
+    delay,
+    agotado,
+    reconnectAttempts: intentos,
+    credencialRechazadaAttempts: rechazos,
+  };
+}
+
 function isValidTenantId(name) {
   if (!name || typeof name !== "string") return false;
   if (name.startsWith(".")) return false;
@@ -361,7 +448,11 @@ async function destroySession(sessionKey, { removeFiles = false } = {}) {
   if (removeFiles) removeSessionFiles(sessionKey);
 }
 
-async function startSession(tenantId, branchId = null, { forceFresh = false, reconnectAttempts = 0 } = {}) {
+async function startSession(
+  tenantId,
+  branchId = null,
+  { forceFresh = false, reconnectAttempts = 0, credencialRechazadaAttempts = 0 } = {},
+) {
   const sessionKey = buildSessionKey(tenantId, branchId);
   const logCtx = buildLogContext(tenantId, branchId);
   const { makeWASocket, useMultiFileAuthState, DisconnectReason } = await getBaileys();
@@ -376,7 +467,7 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
 
   const sessionData = {
     sock: null, status: "starting", qrCode: null, phone: null, jid: null,
-    startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts,
+    startedAt: Date.now(), lidToPhone: new Map(), reconnectAttempts, credencialRechazadaAttempts,
     msgCache: new Map(), sendQueues: new Map(),
     tenantId, branchId: normalizeBranchId(branchId), sessionKey,
   };
@@ -439,6 +530,7 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
       current.phone = phone;
       current.jid = jid;
       current.reconnectAttempts = 0; // conexión sana: resetear contador de reintentos
+      current.credencialRechazadaAttempts = 0; // y el de credenciales rechazadas
 
       console.log("[BRIDGE_CONNECTED_EVENT]", {
         tenant_id: tenantId,
@@ -456,12 +548,19 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = code === DisconnectReason.loggedOut;
       current.qrCode = null;
 
-      // REGLA 1: solo loggedOut (401) borra credenciales y fuerza re-escaneo de QR.
-      // Es el único caso que emite "disconnected" y elimina la carpeta de sesión.
-      if (loggedOut) {
+      const decision = decidirCierreDeConexion({
+        code,
+        reconnectAttempts: current.reconnectAttempts || 0,
+        credencialRechazadaAttempts: current.credencialRechazadaAttempts || 0,
+        loggedOutCode: DisconnectReason.loggedOut,
+        restartRequiredCode: DisconnectReason.restartRequired,
+      });
+
+      // REGLA 1: loggedOut (401) borra credenciales y termina. La sesión no se
+      // rearranca sola: hace falta que alguien pida una nueva.
+      if (decision.accion === "cerrar_sesion") {
         current.status = "disconnected";
         const dcPayload = { tenant_id: tenantId, reconnecting: false };
         if (current.branchId) dcPayload.branch_id = current.branchId;
@@ -471,39 +570,63 @@ async function startSession(tenantId, branchId = null, { forceFresh = false, rec
         return;
       }
 
-      // REGLA 2: cualquier otro motivo (408/428/440/500/503/515, stream errors, etc.)
+      // REGLA 2: WhatsApp ha rechazado las credenciales varias veces seguidas.
+      // Se borran y se arranca una sesión limpia, que es lo único que hace que
+      // Baileys vuelva a emitir un QR. Sin esto la sesión se queda en
+      // "reconnecting" para siempre —se han visto más de 15.000 intentos— y el
+      // negocio no tiene forma de volver a enlazar el teléfono.
+      if (decision.accion === "regenerar_qr") {
+        current.status = "disconnected";
+        current.reconnectAttempts = 0;
+        current.credencialRechazadaAttempts = 0;
+        const dcPayload = { tenant_id: tenantId, reconnecting: true };
+        if (current.branchId) dcPayload.branch_id = current.branchId;
+        await sendWebhook("disconnected", dcPayload);
+        await destroySession(sessionKey, { removeFiles: true });
+        console.warn(
+          `${logCtx} Credentials rejected ${decision.rechazos}x (code=${code}) — ` +
+            `session files removed, starting fresh session to emit a new QR`,
+        );
+        setTimeout(async () => {
+          // Si alguien ya arrancó una sesión por su cuenta mientras esperábamos,
+          // no se pisa: la suya puede estar mostrando un QR a medio escanear.
+          if (sessions.has(sessionKey)) return;
+          try { await startSession(tenantId, branchId, { forceFresh: true }); }
+          catch (err) { console.error(`${logCtx} QR regeneration failed:`, err.message); }
+        }, decision.delay);
+        return;
+      }
+
+      // REGLA 3: cualquier otro motivo (408/428/440/503/515, stream errors, etc.)
       // reconecta reutilizando las credenciales guardadas. NO se borra nada ni se
-      // emite "disconnected".
+      // emite "disconnected": es un corte de red, no un rechazo.
       current.status = "reconnecting";
-
-      // REGLA 3: 515 (restartRequired) no es fatal → reconectar de inmediato reusando creds.
-      const isRestartRequired = code === DisconnectReason.restartRequired;
-
-      current.reconnectAttempts = (current.reconnectAttempts || 0) + 1;
-      const attempts = current.reconnectAttempts;
+      current.reconnectAttempts = decision.reconnectAttempts;
+      current.credencialRechazadaAttempts = decision.credencialRechazadaAttempts;
+      const attempts = decision.reconnectAttempts;
 
       // REGLA 4: al agotar reintentos NO se borran credenciales ni se emite
       // "disconnected": se sigue reintentando con backoff topado (30–60s) y
       // estado "reconnecting".
-      let delay;
-      if (isRestartRequired) {
-        delay = 0;
-      } else if (attempts > MAX_RECONNECT_ATTEMPTS) {
-        delay = Math.min(30000 + 5000 * (attempts - MAX_RECONNECT_ATTEMPTS), 60000);
-        console.warn(`${logCtx} Reconnect attempts exhausted (${attempts}) — keeping saved creds, retrying in ${delay}ms`);
-      } else {
-        delay = Math.min(5000 * attempts, 30000);
+      if (decision.agotado) {
+        console.warn(`${logCtx} Reconnect attempts exhausted (${attempts}) — keeping saved creds, retrying in ${decision.delay}ms`);
       }
 
-      console.log(`${logCtx} Connection closed (code=${code ?? "unknown"}) — reconnecting in ${delay}ms reusing saved creds (attempt ${attempts})`);
+      console.log(`${logCtx} Connection closed (code=${code ?? "unknown"}) — reconnecting in ${decision.delay}ms reusing saved creds (attempt ${attempts})`);
       setTimeout(async () => {
         const latest = sessions.get(sessionKey);
         if (!latest || latest.sock !== sock) return;
         const nextAttempts = latest.reconnectAttempts;
+        const nextRechazos = latest.credencialRechazadaAttempts;
         sessions.delete(sessionKey);
-        try { await startSession(tenantId, branchId, { forceFresh: false, reconnectAttempts: nextAttempts }); }
-        catch (err) { console.error(`${logCtx} Reconnect failed:`, err.message); }
-      }, delay);
+        try {
+          await startSession(tenantId, branchId, {
+            forceFresh: false,
+            reconnectAttempts: nextAttempts,
+            credencialRechazadaAttempts: nextRechazos,
+          });
+        } catch (err) { console.error(`${logCtx} Reconnect failed:`, err.message); }
+      }, decision.delay);
     }
   });
 
